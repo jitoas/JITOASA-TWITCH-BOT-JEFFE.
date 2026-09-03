@@ -13,6 +13,13 @@ const PORT = process.env.PORT || 3000;
 // gemini-3.1-flash-lite is fast, free-tier friendly, and available to new users
 const DEFAULT_MODEL = 'gemini-3.1-flash-lite';
 
+// Free & fast fallback models available through the same Gemini API key
+const FALLBACK_MODELS_POOL = [
+  'gemini-3.5-flash-lite',
+  'gemini-flash-lite-latest',
+  'gemini-3.1-flash-lite',
+];
+
 function resolveModelName(raw) {
   if (raw && typeof raw === 'string') {
     const trimmed = raw.trim();
@@ -25,6 +32,95 @@ function resolveModelName(raw) {
 }
 
 const MODEL_NAME = resolveModelName(process.env.GEMINI_MODEL);
+
+// Brief delay helper for retrying on temporary errors (500–1000ms)
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Detect temporary service errors: 503 UNAVAILABLE, High Demand, Rate Limits
+function isTemporaryServiceError(err) {
+  if (!err) return false;
+  const status = err.status || err.code || err.statusCode;
+  if (status === 503 || status === 'UNAVAILABLE' || status === 429 || status === 'RESOURCE_EXHAUSTED') {
+    return true;
+  }
+  const msg = (err.message || String(err)).toLowerCase();
+  return (
+    msg.includes('503') ||
+    msg.includes('unavailable') ||
+    msg.includes('high demand') ||
+    msg.includes('temporarily') ||
+    msg.includes('overloaded') ||
+    msg.includes('try again later') ||
+    msg.includes('resource_exhausted') ||
+    msg.includes('rate limit')
+  );
+}
+
+/**
+ * Execute Gemini generateContent with automatic retry on 503 / temporary service errors
+ * and graceful fallback across free-tier models. Capped at 2–3 total attempts per request.
+ * NEVER logs or exposes GEMINI_API_KEY.
+ */
+async function generateWithRetryAndFallback(ai, { contents, config }) {
+  const primaryModel = MODEL_NAME;
+  const fallbackCandidates = FALLBACK_MODELS_POOL.filter((m) => m !== primaryModel);
+
+  let attempts = 0;
+  const maxAttempts = 3;
+  let lastError = null;
+
+  // Attempt 1: Try Primary Model
+  try {
+    attempts++;
+    return await ai.models.generateContent({
+      model: primaryModel,
+      contents,
+      config,
+    });
+  } catch (err) {
+    lastError = err;
+    const errStatus = err?.status || err?.code || 'ERROR';
+    console.warn(`[Twitch AI] Primary model ${primaryModel} failed on attempt ${attempts} (${errStatus}):`, err?.message || err);
+
+    // If temporary error (503 UNAVAILABLE, high demand), wait 750ms and retry primary model once
+    if (isTemporaryServiceError(err) && attempts < maxAttempts) {
+      console.log(`[Twitch AI] Temporary error detected on ${primaryModel}. Waiting 750ms before retry...`);
+      await delay(750);
+      try {
+        attempts++;
+        return await ai.models.generateContent({
+          model: primaryModel,
+          contents,
+          config,
+        });
+      } catch (retryErr) {
+        lastError = retryErr;
+        const retryStatus = retryErr?.status || retryErr?.code || 'ERROR';
+        console.warn(`[Twitch AI] Retry on primary model ${primaryModel} failed on attempt ${attempts} (${retryStatus}):`, retryErr?.message || retryErr);
+      }
+    }
+  }
+
+  // Attempt Fallback: Try alternative free models if primary failed
+  for (const fallbackModel of fallbackCandidates) {
+    if (attempts >= maxAttempts) break;
+    attempts++;
+    console.log(`[Twitch AI] Attempting fallback model (${attempts}/${maxAttempts}): ${fallbackModel}`);
+    try {
+      return await ai.models.generateContent({
+        model: fallbackModel,
+        contents,
+        config,
+      });
+    } catch (fallbackErr) {
+      lastError = fallbackErr;
+      const fbStatus = fallbackErr?.status || fallbackErr?.code || 'ERROR';
+      console.warn(`[Twitch AI] Fallback model ${fallbackModel} failed (${fbStatus}):`, fallbackErr?.message || fallbackErr);
+    }
+  }
+
+  throw lastError || new Error('All model attempts failed');
+}
 
 // Middleware
 app.use(cors());
@@ -216,26 +312,11 @@ app.get('/api/ai', async (req, res) => {
       maxOutputTokens: 120,
     };
 
-    // Call Gemini Flash model with automatic fallback
-    let response;
-    try {
-      response = await ai.models.generateContent({
-        model: MODEL_NAME,
-        contents: conversationContents,
-        config: generationConfig,
-      });
-    } catch (modelErr) {
-      if (MODEL_NAME !== DEFAULT_MODEL) {
-        console.warn(`[Twitch AI] Model ${MODEL_NAME} failed, falling back to ${DEFAULT_MODEL}:`, modelErr?.message || modelErr);
-        response = await ai.models.generateContent({
-          model: DEFAULT_MODEL,
-          contents: conversationContents,
-          config: generationConfig,
-        });
-      } else {
-        throw modelErr;
-      }
-    }
+    // Call Gemini Flash model with smart retry and fallback handling
+    const response = await generateWithRetryAndFallback(ai, {
+      contents: conversationContents,
+      config: generationConfig,
+    });
 
     const reply = sanitizeForTwitch(response.text) || 'هلا والله 👋';
 
@@ -324,25 +405,10 @@ app.get('/api/answer', async (req, res) => {
       maxOutputTokens: 100,
     };
 
-    let response;
-    try {
-      response = await ai.models.generateContent({
-        model: MODEL_NAME,
-        contents: evaluationPrompt,
-        config: evalConfig,
-      });
-    } catch (modelErr) {
-      if (MODEL_NAME !== DEFAULT_MODEL) {
-        console.warn(`[Twitch AI] Model ${MODEL_NAME} failed in evaluation, falling back to ${DEFAULT_MODEL}:`, modelErr?.message || modelErr);
-        response = await ai.models.generateContent({
-          model: DEFAULT_MODEL,
-          contents: evaluationPrompt,
-          config: evalConfig,
-        });
-      } else {
-        throw modelErr;
-      }
-    }
+    const response = await generateWithRetryAndFallback(ai, {
+      contents: evaluationPrompt,
+      config: evalConfig,
+    });
 
     const reply = sanitizeForTwitch(response.text) || 'مالك لواء، غلططط 😂';
 
@@ -641,8 +707,12 @@ app.get('/', (req, res) => {
         <div class="status-value">جاهز للاستقبال • 200 OK</div>
       </div>
       <div class="status-card">
-        <div class="status-label">نموذج الذكاء الاصطناعي</div>
+        <div class="status-label">نموذج الذكاء الاصطناعي الأساسي</div>
         <div class="status-value" style="font-family: monospace; font-size: 13px;">${MODEL_NAME}</div>
+      </div>
+      <div class="status-card">
+        <div class="status-label">نظام الحماية من 503 (Fallback)</div>
+        <div class="status-value" style="font-size: 12px; color: var(--success-text);">مفعل تلقائياً مع نماذج بديلة</div>
       </div>
       <div class="status-card">
         <div class="status-label">صيغة الرد لشات تويتش</div>
