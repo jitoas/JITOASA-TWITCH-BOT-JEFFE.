@@ -70,6 +70,84 @@ const SYSTEM_INSTRUCTION = `أنت شات بوت ومتابع في شات توي
 7. التنوع: تجنب تكرار نفس الكلمات أو العبارات في كل رد، ونوّع في أسلوبك دائماً.
 8. الصيغة النهائية: أرجع نصاً عادياً فقط (Plain Text) بدون أي تنسيق Markdown (بدون نجوم *، بدون #، بدون شرطات أو علامات تنصيص)، ليكون متوافقاً تماماً مع Nightbot وتويتش.`;
 
+// Answer evaluation system instruction for !a
+const ANSWER_EVALUATION_INSTRUCTION = `أنت شات بوت ومتابع في شات تويتش (Twitch Chat Bot).
+مهمتك: تقييم إجابة المتابع على السؤال الذي طُرح عليه سابقاً.
+الأسلوب والتعليمات:
+1. تحدث دائماً باللهجة السعودية العامية العفوية والخفيفة جداً (مثل: كفو، مالك لواء، يا وحش، ههههه، من جد).
+2. اجعل الرد قصير جداً ومباشر (جملة أو جملتين فقط، بحد أقصى 150 حرف)، مناسب لشات تويتش وسرعته.
+3. إذا كانت الإجابة صحيحة أو قريبة جداً من الصواب: شجعه بحماس وطقطقة خفيفة، مثل: "جوابك صححح 🔥" أو "كفو والله، إجابة صحيحة يا وحش! 🔥".
+4. إذا كانت الإجابة خاطئة: امزح معه وطقطق بخفة واذكر له الجواب الصحيح باختصار، مثل: "غلططط 😂، الجواب الصح هو [...]" أو "مالك لواء، غلططط 😂".
+5. تعامل مع الإجابات النصية والأرقام والكلمات المرادفة بذكاء ومرونة.
+6. لا تخترع وجود سؤال إذا لم يذكر في سياق السؤال السابق.
+7. الرد يجب أن يكون نصاً عادياً فقط (Plain Text) بدون Markdown أو علامات تنصيص أو نجوم نهائياً.`;
+
+// In-Memory Conversation & Question Management (per user or global)
+const userMemoryMap = new Map();
+const MAX_TRACKED_USERS = 250;
+const MAX_HISTORY_MESSAGES = 6; // up to 3 turns (user + assistant)
+const QUESTION_EXPIRY_MS = 15 * 60 * 1000; // 15 minutes
+
+function getUserState(userKey) {
+  let state = userMemoryMap.get(userKey);
+  if (!state) {
+    // Evict oldest user if memory exceeds max limit
+    if (userMemoryMap.size >= MAX_TRACKED_USERS) {
+      const oldestKey = userMemoryMap.keys().next().value;
+      userMemoryMap.delete(oldestKey);
+    }
+    state = {
+      history: [],
+      lastQuestion: null,
+      lastActive: Date.now(),
+    };
+    userMemoryMap.set(userKey, state);
+  }
+  state.lastActive = Date.now();
+  return state;
+}
+
+// Common rhetorical greetings that shouldn't be treated as trivia/quiz questions
+const RHETORICAL_GREETINGS = [
+  'وش مسوي',
+  'كيفك',
+  'شلونك',
+  'شخبارك',
+  'كيف حالك',
+  'وش اخبارك',
+  'وش أخبارك',
+  'وش علومك',
+  'عساك بخير',
+  'عساك طيب',
+  'وش وضعك',
+  'وش رايك',
+];
+
+// Helper to check if text contains an explicit question directed at the chatter
+function extractQuestion(text) {
+  if (!text || (!text.includes('؟') && !text.includes('?'))) {
+    return null;
+  }
+  // Split into sentences and find candidate question
+  const sentences = text.split(/[\.\!\n\r]/);
+  for (const s of sentences) {
+    if (s.includes('؟') || s.includes('?')) {
+      const cleaned = s.trim();
+      if (cleaned.length >= 6) {
+        const stripped = cleaned.replace(/[؟?!\.,]/g, '').trim();
+        // Check if it's merely a casual greeting inquiry
+        const isGreeting = RHETORICAL_GREETINGS.some(
+          g => stripped === g || stripped.endsWith(g) || (stripped.startsWith(g) && stripped.length < g.length + 6)
+        );
+        if (!isGreeting) {
+          return cleaned;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 // Clean up text for Twitch chat single-line output
 function sanitizeForTwitch(text) {
   if (!text) return '';
@@ -92,12 +170,15 @@ app.get('/health', (req, res) => {
 
 /**
  * Main Twitch Nightbot AI Endpoint
- * GET /api/ai?q=VIEWER_MESSAGE
+ * GET /api/ai?q=VIEWER_MESSAGE&user=USERNAME
  * Returns plain text ONLY
  */
 app.get('/api/ai', async (req, res) => {
   try {
     const rawQuery = req.query.q;
+    const rawUser = req.query.user;
+    const username = (rawUser && typeof rawUser === 'string' && rawUser.trim()) ? rawUser.trim() : 'global';
+    const userKey = username.toLowerCase();
 
     // Handle empty query parameter gracefully
     if (!rawQuery || typeof rawQuery !== 'string' || !rawQuery.trim()) {
@@ -107,7 +188,8 @@ app.get('/api/ai', async (req, res) => {
         .send('وش تبي تقول؟ اكتب رسالتك بعد الأمر يا غالي 👋');
     }
 
-    const userMessage = rawQuery.trim();
+    // Protect against excessively large inputs
+    const userMessage = rawQuery.trim().slice(0, 400);
 
     // Check Gemini API key
     const ai = getGeminiClient();
@@ -118,6 +200,14 @@ app.get('/api/ai', async (req, res) => {
         .status(200)
         .send('الـAI مشغول شوي 😂');
     }
+
+    const userState = getUserState(userKey);
+
+    // Prepare multi-turn contents with recent history for context
+    const conversationContents = [
+      ...userState.history.slice(-MAX_HISTORY_MESSAGES),
+      { role: 'user', parts: [{ text: userMessage }] },
+    ];
 
     // Standard generation configuration
     const generationConfig = {
@@ -131,7 +221,7 @@ app.get('/api/ai', async (req, res) => {
     try {
       response = await ai.models.generateContent({
         model: MODEL_NAME,
-        contents: userMessage,
+        contents: conversationContents,
         config: generationConfig,
       });
     } catch (modelErr) {
@@ -139,7 +229,7 @@ app.get('/api/ai', async (req, res) => {
         console.warn(`[Twitch AI] Model ${MODEL_NAME} failed, falling back to ${DEFAULT_MODEL}:`, modelErr?.message || modelErr);
         response = await ai.models.generateContent({
           model: DEFAULT_MODEL,
-          contents: userMessage,
+          contents: conversationContents,
           config: generationConfig,
         });
       } else {
@@ -149,6 +239,23 @@ app.get('/api/ai', async (req, res) => {
 
     const reply = sanitizeForTwitch(response.text) || 'هلا والله 👋';
 
+    // Update conversation history
+    userState.history.push({ role: 'user', parts: [{ text: userMessage }] });
+    userState.history.push({ role: 'model', parts: [{ text: reply }] });
+    if (userState.history.length > MAX_HISTORY_MESSAGES) {
+      userState.history = userState.history.slice(-MAX_HISTORY_MESSAGES);
+    }
+
+    // Check if the reply asks an explicit question to save as the last question
+    const question = extractQuestion(reply);
+    if (question) {
+      userState.lastQuestion = {
+        question: question,
+        askedAt: Date.now(),
+        userName: username,
+      };
+    }
+
     return res
       .type('text/plain; charset=utf-8')
       .status(200)
@@ -156,6 +263,102 @@ app.get('/api/ai', async (req, res) => {
   } catch (error) {
     console.error('[Twitch AI] Error generating response:', error?.message || error);
     // Never crash the server, return a friendly fallback in Saudi Arabic
+    return res
+      .type('text/plain; charset=utf-8')
+      .status(200)
+      .send('الـAI مشغول شوي 😂');
+  }
+});
+
+/**
+ * Answer Evaluation Endpoint for Nightbot !a
+ * GET /api/answer?q=ANSWER&user=USERNAME
+ * Returns plain text ONLY
+ */
+app.get('/api/answer', async (req, res) => {
+  try {
+    const rawQuery = req.query.q;
+    const rawUser = req.query.user;
+    const username = (rawUser && typeof rawUser === 'string' && rawUser.trim()) ? rawUser.trim() : 'global';
+    const userKey = username.toLowerCase();
+
+    // Check if viewer provided an answer
+    if (!rawQuery || typeof rawQuery !== 'string' || !rawQuery.trim()) {
+      return res
+        .type('text/plain; charset=utf-8')
+        .status(200)
+        .send('وش جوابك؟ اكتب إجابتك بعد الأمر يا غالي 👋');
+    }
+
+    // Protect against excessively large inputs
+    const answerText = rawQuery.trim().slice(0, 300);
+    const userState = getUserState(userKey);
+
+    // Check if there is an active question for this user within validity window
+    if (!userState.lastQuestion || (Date.now() - userState.lastQuestion.askedAt > QUESTION_EXPIRY_MS)) {
+      return res
+        .type('text/plain; charset=utf-8')
+        .status(200)
+        .send('ما عندي سؤال لك الحين 😂');
+    }
+
+    const previousQuestion = userState.lastQuestion.question;
+    // Clear question once answered so it is not re-evaluated repeatedly
+    userState.lastQuestion = null;
+
+    // Check Gemini API key
+    const ai = getGeminiClient();
+    if (!ai) {
+      console.warn('[Twitch AI] GEMINI_API_KEY is not set in environment variables');
+      return res
+        .type('text/plain; charset=utf-8')
+        .status(200)
+        .send('الـAI مشغول شوي 😂');
+    }
+
+    const evaluationPrompt = `السؤال السابق الذي طُرح على المتابع: "${previousQuestion}"\nإجابة المتابع: "${answerText}"\nقم بتقييم الإجابة هل هي صحيحة أم خاطئة، ورد بأسلوب شات تويتش السعودي القصير جداً.`;
+
+    const evalConfig = {
+      systemInstruction: ANSWER_EVALUATION_INSTRUCTION,
+      temperature: 0.7,
+      maxOutputTokens: 100,
+    };
+
+    let response;
+    try {
+      response = await ai.models.generateContent({
+        model: MODEL_NAME,
+        contents: evaluationPrompt,
+        config: evalConfig,
+      });
+    } catch (modelErr) {
+      if (MODEL_NAME !== DEFAULT_MODEL) {
+        console.warn(`[Twitch AI] Model ${MODEL_NAME} failed in evaluation, falling back to ${DEFAULT_MODEL}:`, modelErr?.message || modelErr);
+        response = await ai.models.generateContent({
+          model: DEFAULT_MODEL,
+          contents: evaluationPrompt,
+          config: evalConfig,
+        });
+      } else {
+        throw modelErr;
+      }
+    }
+
+    const reply = sanitizeForTwitch(response.text) || 'مالك لواء، غلططط 😂';
+
+    // Store in history for continuity
+    userState.history.push({ role: 'user', parts: [{ text: `[إجابتي على سؤال: ${previousQuestion}]: ${answerText}` }] });
+    userState.history.push({ role: 'model', parts: [{ text: reply }] });
+    if (userState.history.length > MAX_HISTORY_MESSAGES) {
+      userState.history = userState.history.slice(-MAX_HISTORY_MESSAGES);
+    }
+
+    return res
+      .type('text/plain; charset=utf-8')
+      .status(200)
+      .send(reply);
+  } catch (error) {
+    console.error('[Twitch AI] Error evaluating answer:', error?.message || error);
     return res
       .type('text/plain; charset=utf-8')
       .status(200)
@@ -466,12 +669,25 @@ app.get('/', (req, res) => {
     </div>
 
     <div class="card">
-      <h2>أمر Nightbot المباشر للشات</h2>
-      <p class="card-caption">انسخ هذا الأمر وضعه مباشرة في شات تويتش لديك لتفعيل البوت:</p>
-      <div class="code-block" id="nightbotCmd">!addcom !ai $(urlfetch <span id="appDomain"></span>/api/ai?q=$(querystring))</div>
-      <div style="display: flex; align-items: center;">
-        <button class="btn-secondary" onclick="copyNightbotCmd()">نسخ الأمر</button>
-        <span id="copyFeedback" class="copy-status">تم النسخ إلى الحافظة ✓</span>
+      <h2>أوامر Nightbot المباشرة للشات</h2>
+      <p class="card-caption">أضف هذه الأوامر مباشرة في شات تويتش لديك لتفعيل الرد الذكي ونظام الإجابات:</p>
+      
+      <div style="margin-bottom: 16px;">
+        <div style="font-size: 13px; font-weight: 600; margin-bottom: 4px; color: var(--text);">1. أمر الذكاء الاصطناعي العام (!ai):</div>
+        <div class="code-block" id="nightbotCmdAi">!commands add !ai $(urlfetch <span class="appDomainSpan"></span>/api/ai?q=$(querystring)&user=$(user))</div>
+        <div style="display: flex; align-items: center;">
+          <button class="btn-secondary" onclick="copyCmd('ai')">نسخ أمر !ai</button>
+          <span id="copyFeedbackAi" class="copy-status">تم النسخ إلى الحافظة ✓</span>
+        </div>
+      </div>
+
+      <div>
+        <div style="font-size: 13px; font-weight: 600; margin-bottom: 4px; color: var(--text);">2. أمر تقييم الإجابات (!a):</div>
+        <div class="code-block" id="nightbotCmdAns">!commands add !a $(urlfetch <span class="appDomainSpan"></span>/api/answer?q=$(querystring)&user=$(user))</div>
+        <div style="display: flex; align-items: center;">
+          <button class="btn-secondary" onclick="copyCmd('ans')">نسخ أمر !a</button>
+          <span id="copyFeedbackAns" class="copy-status">تم النسخ إلى الحافظة ✓</span>
+        </div>
       </div>
     </div>
 
@@ -490,10 +706,20 @@ app.get('/', (req, res) => {
       <div class="endpoint-item">
         <div style="display: flex; align-items: center;">
           <span class="method">GET</span>
-          <code style="color: #374151; font-weight: 500; margin-right: 8px;">/api/ai?q=نص_المتابع</code>
+          <code style="color: #374151; font-weight: 500; margin-right: 8px;">/api/ai?q=النص&user=المستخدم</code>
         </div>
         <div style="display: flex; align-items: center; gap: 12px;">
-          <span style="color: var(--text-muted); font-size: 13px;">يرجع رد الذكاء الاصطناعي كنص عادي فقط</span>
+          <span style="color: var(--text-muted); font-size: 13px;">يرجع رد الذكاء الاصطناعي مع حفظ سياق المحادثة</span>
+          <span class="status-ok">200 OK</span>
+        </div>
+      </div>
+      <div class="endpoint-item">
+        <div style="display: flex; align-items: center;">
+          <span class="method">GET</span>
+          <code style="color: #374151; font-weight: 500; margin-right: 8px;">/api/answer?q=الإجابة&user=المستخدم</code>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span style="color: var(--text-muted); font-size: 13px;">يقيم إجابة المشاهد على آخر سؤال طرحه البوت</span>
           <span class="status-ok">200 OK</span>
         </div>
       </div>
@@ -502,7 +728,7 @@ app.get('/', (req, res) => {
 
   <script>
     const origin = window.location.origin;
-    document.getElementById('appDomain').innerText = origin;
+    document.querySelectorAll('.appDomainSpan').forEach(el => el.innerText = origin);
 
     function setQuery(text) {
       document.getElementById('queryInput').value = text;
@@ -514,7 +740,7 @@ app.get('/', (req, res) => {
       const box = document.getElementById('resultBox');
       box.innerText = 'جاري المعالجة من Gemini...';
       try {
-        const res = await fetch('/api/ai?q=' + encodeURIComponent(q));
+        const res = await fetch('/api/ai?q=' + encodeURIComponent(q) + '&user=tester');
         const text = await res.text();
         box.innerText = text;
       } catch (err) {
@@ -522,12 +748,22 @@ app.get('/', (req, res) => {
       }
     }
 
-    function copyNightbotCmd() {
-      const cmd = '!addcom !ai $(urlfetch ' + origin + '/api/ai?q=$(querystring))';
+    function copyCmd(type) {
+      let cmd = '';
+      let fbId = '';
+      if (type === 'ai') {
+        cmd = '!commands add !ai $(urlfetch ' + origin + '/api/ai?q=$(querystring)&user=$(user))';
+        fbId = 'copyFeedbackAi';
+      } else {
+        cmd = '!commands add !a $(urlfetch ' + origin + '/api/answer?q=$(querystring)&user=$(user))';
+        fbId = 'copyFeedbackAns';
+      }
       navigator.clipboard.writeText(cmd).then(() => {
-        const fb = document.getElementById('copyFeedback');
-        fb.style.display = 'inline';
-        setTimeout(() => { fb.style.display = 'none'; }, 2500);
+        const fb = document.getElementById(fbId);
+        if (fb) {
+          fb.style.display = 'inline';
+          setTimeout(() => { fb.style.display = 'none'; }, 2500);
+        }
       });
     }
   </script>

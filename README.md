@@ -29,12 +29,15 @@ twitch-ai/
 - **Response**: Plain text `OK` (HTTP 200)
 - **Purpose**: Verifies that the server is alive (used by Render health checks).
 
-### 2. Twitch AI Chatbot
-- **URL**: `GET /api/ai?q=VIEWER_MESSAGE`
+### 2. Twitch AI Chatbot (with Memory)
+- **URL**: `GET /api/ai?q=VIEWER_MESSAGE&user=VIEWER_USERNAME`
 - **Response**: Plain text only (HTTP 200)
-- **Example**:
-  - Request: `GET /api/ai?q=وش تسوي؟`
-  - Response: `جالس اتابع معك ومستمتع بالبث يا غالي 😂`
+- **Features**: Remembers conversation context per user in memory.
+
+### 3. Answer Evaluation Endpoint (!a)
+- **URL**: `GET /api/answer?q=ANSWER&user=VIEWER_USERNAME`
+- **Response**: Plain text only (HTTP 200)
+- **Features**: Evaluates viewer answers to the AI's recent questions. Returns `ما عندي سؤال لك الحين 😂` if no question is pending.
 
 ---
 
@@ -77,19 +80,27 @@ twitch-ai/
 
 ## 🤖 Nightbot Setup (Twitch Chat)
 
-Once deployed, copy your Render URL (e.g., `https://twitch-ai-xyz.onrender.com`).
+Once deployed, copy your Render URL (e.g., `https://twitch-bot-jeffe.onrender.com`).
 
-Run this single command in your Twitch chat:
+Add these commands to your Twitch chat:
 
+1. **General Chatbot Command (`!ai`)**:
 ```text
-!addcom !ai $(urlfetch https://YOUR-RENDER-APP.onrender.com/api/ai?q=$(querystring))
+!commands add !ai $(urlfetch https://YOUR-RENDER-APP.onrender.com/api/ai?q=$(querystring)&user=$(user))
+```
+
+2. **Answer Evaluation Command (`!a`)**:
+```text
+!commands add !a $(urlfetch https://YOUR-RENDER-APP.onrender.com/api/answer?q=$(querystring)&user=$(user))
 ```
 
 ### Testing in Twitch Chat:
-- Viewer: `!ai مرحبا`
-- Nightbot: `هلا والله! نورت الشات يا بعدي 👋`
-- Viewer: `!ai وش تسوي؟`
-- Nightbot: `أراقب الشات وأسولف معكم 😂`
+- Viewer: `!ai اسألني سؤال`
+- Nightbot: `أبشر يا وحش! وش هي عاصمة فرنسا؟ أجب بأمر !a`
+- Viewer: `!a باريس`
+- Nightbot: `كفو والله، صح مية بالمية يا وحش! 🔥`
+- Viewer: `!a برلين` (after already answered)
+- Nightbot: `ما عندي سؤال لك الحين 😂`
 
 ---
 
