@@ -12,7 +12,19 @@ const PORT = process.env.PORT || 3000;
 // Default Gemini Flash model (easily configurable via GEMINI_MODEL env var)
 // gemini-3.1-flash-lite is fast, free-tier friendly, and available to new users
 const DEFAULT_MODEL = 'gemini-3.1-flash-lite';
-const MODEL_NAME = process.env.GEMINI_MODEL || DEFAULT_MODEL;
+
+function resolveModelName(raw) {
+  if (raw && typeof raw === 'string') {
+    const trimmed = raw.trim();
+    // Validate model format: starts with 'gemini-' or 'models/gemini-', contains only valid characters
+    if (/^(models\/)?gemini-[a-zA-Z0-9.-]+$/.test(trimmed)) {
+      return trimmed;
+    }
+  }
+  return DEFAULT_MODEL;
+}
+
+const MODEL_NAME = resolveModelName(process.env.GEMINI_MODEL);
 
 // Middleware
 app.use(cors());
@@ -22,13 +34,20 @@ app.use(express.urlencoded({ extended: true }));
 // Lazy initialization for Google Gen AI client
 let aiClient = null;
 function getGeminiClient() {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
+  let apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || !apiKey.trim()) {
+    // Fallback in case the user accidentally entered their API key in GEMINI_MODEL
+    const candidate = process.env.GEMINI_MODEL;
+    if (candidate && (candidate.startsWith('AIza') || candidate.startsWith('AQ.'))) {
+      apiKey = candidate.trim();
+    }
+  }
+  if (!apiKey || !apiKey.trim()) {
     return null;
   }
   if (!aiClient) {
     aiClient = new GoogleGenAI({
-      apiKey: apiKey,
+      apiKey: apiKey.trim(),
       httpOptions: {
         headers: {
           'User-Agent': 'aistudio-build',
@@ -103,16 +122,34 @@ app.get('/api/ai', async (req, res) => {
         .send('الـAI مشغول شوي 😂');
     }
 
-    // Call Gemini Flash model
-    const response = await ai.models.generateContent({
-      model: MODEL_NAME,
-      contents: userMessage,
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        temperature: 0.85,
-        maxOutputTokens: 120,
-      },
-    });
+    // Call Gemini Flash model with automatic fallback
+    let response;
+    try {
+      response = await ai.models.generateContent({
+        model: MODEL_NAME,
+        contents: userMessage,
+        config: {
+          systemInstruction: SYSTEM_INSTRUCTION,
+          temperature: 0.85,
+          maxOutputTokens: 120,
+        },
+      });
+    } catch (modelErr) {
+      if (MODEL_NAME !== DEFAULT_MODEL) {
+        console.warn(`[Twitch AI] Model ${MODEL_NAME} failed, falling back to ${DEFAULT_MODEL}:`, modelErr?.message || modelErr);
+        response = await ai.models.generateContent({
+          model: DEFAULT_MODEL,
+          contents: userMessage,
+          config: {
+            systemInstruction: SYSTEM_INSTRUCTION,
+            temperature: 0.85,
+            maxOutputTokens: 120,
+          },
+        });
+      } else {
+        throw modelErr;
+      }
+    }
 
     const reply = sanitizeForTwitch(response.text) || 'هلا والله 👋';
 
@@ -406,7 +443,7 @@ app.get('/', (req, res) => {
       </div>
       <div class="status-card">
         <div class="status-label">نموذج الذكاء الاصطناعي</div>
-        <div class="status-value" style="font-family: monospace; font-size: 13px;">gemini-3.1-flash-lite</div>
+        <div class="status-value" style="font-family: monospace; font-size: 13px;">${MODEL_NAME}</div>
       </div>
       <div class="status-card">
         <div class="status-label">صيغة الرد لشات تويتش</div>
