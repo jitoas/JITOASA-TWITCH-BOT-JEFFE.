@@ -1,0 +1,6 @@
+{
+  "name": "Twitch AI Chatbot API",
+  "description": "A standalone Node.js Express backend API for Twitch Nightbot powered by Gemini Flash, returning Saudi Arabic chat responses.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

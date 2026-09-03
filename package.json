@@ -1,0 +1,19 @@
+{
+  "name": "twitch-ai",
+  "version": "1.0.0",
+  "description": "Standalone Node.js backend API for Twitch Nightbot powered by Gemini",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js",
+    "build": "node -e \"console.log('Build completed successfully')\"",
+    "lint": "node --check src/server.js"
+  },
+  "dependencies": {
+    "@google/genai": "^2.4.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2"
+  }
+}
