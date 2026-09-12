@@ -13,15 +13,6 @@ const PORT = process.env.PORT || 3000;
 // gemini-3.1-flash-lite is fast, free-tier friendly, and verified available
 const DEFAULT_MODEL = 'gemini-3.1-flash-lite';
 
-// Verified active, fast, free-tier compatible Gemini models for ordered fallback
-const ORDERED_FALLBACK_MODELS = [
-  'gemini-3.5-flash-lite',
-  'gemini-flash-lite-latest',
-  'gemini-3.5-flash',
-  'gemini-3.6-flash',
-  'gemini-flash-latest',
-];
-
 function resolveModelName(raw) {
   if (raw && typeof raw === 'string') {
     const trimmed = raw.trim();
@@ -35,83 +26,121 @@ function resolveModelName(raw) {
 
 const MODEL_NAME = resolveModelName(process.env.GEMINI_MODEL);
 
+// Single, verified active fallback model (different from primary model)
+// Prioritizes low request pressure and fast recovery without multi-model loops
+const FALLBACK_MODEL = (MODEL_NAME === 'gemini-3.5-flash-lite')
+  ? 'gemini-3.1-flash-lite'
+  : 'gemini-3.5-flash-lite';
+
 // Delay helper
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Short randomized jitter (300–800ms) to avoid synchronized retry storms
-const randomJitter = (min = 300, max = 800) =>
+// Short randomized jitter (300–600ms) to avoid synchronized retry storms
+const randomJitter = (min = 300, max = 600) =>
   Math.floor(Math.random() * (max - min + 1)) + min;
 
-// Detect temporary service errors: 503 UNAVAILABLE, High Demand, Rate Limits
-function isTemporaryServiceError(err) {
+// Only retry transient availability errors: HTTP 503, UNAVAILABLE, temporary high demand
+// Do NOT retry auth errors, bad requests, missing models, or quota limits
+function isTemporaryAvailabilityError(err) {
   if (!err) return false;
   const status = err.status || err.code || err.statusCode;
-  if (status === 503 || status === 'UNAVAILABLE' || status === 429 || status === 'RESOURCE_EXHAUSTED') {
+
+  // Direct 503 or UNAVAILABLE status code
+  if (status === 503 || status === 'UNAVAILABLE') {
     return true;
   }
+
+  // Explicit non-retryable status codes
+  if (
+    status === 400 ||
+    status === 401 ||
+    status === 403 ||
+    status === 404 ||
+    status === 429 ||
+    status === 'INVALID_ARGUMENT' ||
+    status === 'PERMISSION_DENIED' ||
+    status === 'NOT_FOUND' ||
+    status === 'UNAUTHENTICATED' ||
+    status === 'RESOURCE_EXHAUSTED'
+  ) {
+    return false;
+  }
+
   const msg = (err.message || String(err)).toLowerCase();
+
+  // Exclude permanent client/auth/quota issues
+  if (
+    msg.includes('api_key') ||
+    msg.includes('permission') ||
+    msg.includes('not found') ||
+    msg.includes('quota') ||
+    msg.includes('resource_exhausted') ||
+    msg.includes('rate limit')
+  ) {
+    return false;
+  }
+
+  // Detect genuine temporary 503 / unavailable / high-demand strings
   return (
     msg.includes('503') ||
     msg.includes('unavailable') ||
     msg.includes('high demand') ||
     msg.includes('temporarily') ||
     msg.includes('overloaded') ||
-    msg.includes('try again later') ||
-    msg.includes('resource_exhausted') ||
-    msg.includes('rate limit')
+    msg.includes('service unavailable')
   );
 }
 
 /**
- * Execute Gemini generateContent with strong, fast fallback against 503 / UNAVAILABLE / high-demand errors.
- * - Does not repeatedly hammer the same busy model.
- * - If a model encounters 503 / high-demand, it moves quickly to the next fallback model after a short randomized delay (300-800ms).
- * - Capped at 3 attempts total to prevent latency spikes in Twitch chat.
+ * Execute Gemini generateContent prioritizing LOW REQUEST PRESSURE and FAST RECOVERY:
+ * - Maximum 2 Gemini attempts per incoming request.
+ * - Attempt 1: primary model.
+ * - If temporary 503/UNAVAILABLE/high-demand: wait short randomized delay (300–600ms).
+ * - Attempt 2: ONE fallback model.
+ * - Never retries the same model twice. Never tries 3, 4, or more models.
  * - NEVER logs or exposes GEMINI_API_KEY.
  */
 async function generateWithRetryAndFallback(ai, { contents, config }) {
-  const primaryModel = MODEL_NAME;
-  // Build unique ordered list starting with primaryModel, followed by ordered fallbacks
-  const modelChain = [
-    primaryModel,
-    ...ORDERED_FALLBACK_MODELS.filter((m) => m !== primaryModel),
-  ];
+  // Attempt 1: Primary Model
+  try {
+    return await ai.models.generateContent({
+      model: MODEL_NAME,
+      contents,
+      config,
+    });
+  } catch (primaryErr) {
+    const errStatus = primaryErr?.status || primaryErr?.code || 'ERROR';
+    console.warn(`[Twitch AI] Primary model ${MODEL_NAME} failed (Status: ${errStatus})`);
 
-  let attempts = 0;
-  const maxAttempts = 3;
-  let lastError = null;
+    // Only retry transient availability errors (503 / UNAVAILABLE / high-demand)
+    if (!isTemporaryAvailabilityError(primaryErr)) {
+      throw primaryErr;
+    }
 
-  for (const currentModel of modelChain) {
-    if (attempts >= maxAttempts) break;
-    attempts++;
+    // Short randomized delay (300-600ms) before the single fallback attempt
+    const jitterMs = randomJitter(300, 600);
+    console.log(`[Twitch AI] Temporary availability error on ${MODEL_NAME}. Trying single fallback model ${FALLBACK_MODEL} in ${jitterMs}ms...`);
+    await delay(jitterMs);
 
+    // Attempt 2: ONE fallback model (never retry primary, never try a 3rd model)
     try {
-      if (attempts > 1) {
-        console.log(`[Twitch AI] Attempting fallback model (${attempts}/${maxAttempts}): ${currentModel}`);
-      }
       return await ai.models.generateContent({
-        model: currentModel,
+        model: FALLBACK_MODEL,
         contents,
         config,
       });
-    } catch (err) {
-      lastError = err;
-      const errStatus = err?.status || err?.code || 'ERROR';
-      const errMsg = err?.message || String(err);
-      console.warn(`[Twitch AI] Model ${currentModel} failed on attempt ${attempts}/${maxAttempts} (${errStatus}):`, errMsg);
-
-      // If temporary high-demand / 503 / UNAVAILABLE error and we still have attempts left:
-      // Move quickly to the NEXT fallback model rather than retrying the same busy model.
-      if (isTemporaryServiceError(err) && attempts < maxAttempts) {
-        const jitterMs = randomJitter(300, 800);
-        console.log(`[Twitch AI] Model ${currentModel} experienced temporary service error (${errStatus}). Moving to next fallback model in ${jitterMs}ms...`);
-        await delay(jitterMs);
-      }
+    } catch (fallbackErr) {
+      const fbStatus = fallbackErr?.status || fallbackErr?.code || 'ERROR';
+      console.warn(`[Twitch AI] Fallback model ${FALLBACK_MODEL} failed (Status: ${fbStatus})`);
+      throw fallbackErr;
     }
   }
-
-  throw lastError || new Error('All model attempts failed');
 }
+
+// Lightweight in-memory concurrency guards (no Redis or external dependencies)
+const activeUserRequests = new Set();
+let activeGlobalRequests = 0;
+const MAX_GLOBAL_CONCURRENT = 4;
 
 // Middleware
 app.use(cors());
@@ -152,6 +181,7 @@ const SYSTEM_INSTRUCTION = `أنت شات بوت ومتابع في شات توي
 2. سياق الأشخاص وتمييز الأدوار (People Context & Role Distinction):
    - "جيف" / "Jef" (جيف، جِيف، jef، Jef): هو الستريمر وصاحب قناة تويتش (Streamer/Owner). إذا سألك أحد عن رأيك في جيف (مثل "وش رايك في جيف؟" أو سأل عنه)، تحدث عنه بإيجابية وامدحه بصدق وحماس وبشكل عفوي كصاحب البث. لا تخترع إنجازات أو قصص شخصية أو وقائع غير معروفة عنه. لا تمدحه عشوائياً إذا لم يكن أحد يتكلم عنه، وإذا ذكر اسمه في سياق عادي بدون سؤال عن الرأي، لا تبدأ بمديح طويل غير مطلوب وتجاوب حسب السياق الفعلي فقط.
    - "جيتو" / "Jito" (جيتو، Jito، jito): هو المود/المشرف في مجتمع تويتش (Moderator/Helper) وهو أيضاً الشخص الذي قام بصنع وبرمجة وتطوير وبناء جعفر. إذا سألك أحد "وش رايك في جيتو؟"، امدح جيتو بشكل خاص وأقوى واعتبره أفضل وأفخم مود، واذكر بشكل طبيعي وعفوي في سياق الحديث أنه هو اللي صنعك/طورك (مثال: "جيتو؟ هذا رجال كفو وأفضل مود شفته في حياتي 🔥 وهو اللي صممني وضبطني"). نوّع في كلمات المدح دائماً ولا تكرر نفس العبارة بالحرف. لا تخترع أي تفاصيل تقنية حول ما بناه. ولا تمدحه عشوائياً إلا إذا سأل أحد عنه أو كان سياق الحديث يتعلق به بشكل طبيعي. وإذا ذكر اسمه فقط في سياق عادي، تفاعل حسب السياق ولا تبدأ بمديح طويل غير مطلوب.
+   - "عفيفي" / "Afifi" (عفيفي، Afifi، afifi): هو أقوى داعم (Top / Strongest Supporter) للستريمر وللشات، ولقبه وسياقه هو "أقوى داعم" (تفصيلة سياقية للشخصية وليست معلومة تحتاج تحققاً من سجلات تبرعات أو اشتراكات). إذا سألك أحد "وش رايك في عفيفي؟" أو "من عفيفي؟" أو تحدث عنه المتابعون بشكل طبيعي، تجاوب بإيجابية واعترف به كأقوى داعم (مثال: "عفيفي؟ هذا الداعم الثقيل، وجوده لحاله يرفع المعنويات"، "عفيفي معروف، أقوى داعم عندنا"، "عفيفي؟ هذا ما يحتاج تعريف، داعم من الطراز الثقيل"). نوّع في صياغة الردود بشكل طبيعي. تنبيه مهم جداً بخصوص عفيفي: لا تستخدم إيموجيات أو تعبيرات الضحك (بدون 😂 وبدون ههههه) عند الحديث عن عفيفي احتراماً وتقديراً له. لا تذكره باستمرار ولا تذكره عشوائياً إذا لم يكن أحد يتكلم عنه. لا تخترع أرقام أو مبالغ تبرعات أو عدد اشتراكات أو ترتيبات مالية، ولا تدّعي أنه حرفياً الأول عالمياً أو على مستوى تويتش ككل. اجعل الرد قصيراً وطبيعياً ومناسباً لشات تويتش.
    - المتابعون الآخرون: متابعون عاديون في الشات، عاملهم باحترام وخوة وعفوية وسلاسة.
    - تجنب التكلف أو أن تبدو كإعلان ترويجي أو رسالة ملقنة؛ خلك طبيعي، عفوي، وبلهجة سعودية حقيقية.
 3. اللهجة: تحدث دائماً باللهجة السعودية العامية الطبيعية والخفيفة جداً (مثل: هلا والله، ياخي، وش السالفة، ههههه، أبشر، تسلم، يارجال، من جد، كفو، يا وحش).
@@ -267,20 +297,41 @@ app.get('/health', (req, res) => {
  * Returns plain text ONLY
  */
 app.get('/api/ai', async (req, res) => {
+  const rawQuery = req.query.q;
+  const rawUser = req.query.user;
+  const username = (rawUser && typeof rawUser === 'string' && rawUser.trim()) ? rawUser.trim() : 'global';
+  const userKey = username.toLowerCase();
+
+  // Handle empty query parameter gracefully
+  if (!rawQuery || typeof rawQuery !== 'string' || !rawQuery.trim()) {
+    return res
+      .type('text/plain; charset=utf-8')
+      .status(200)
+      .send('وش تبي تقول؟ اكتب رسالتك بعد الأمر يا غالي 👋');
+  }
+
+  // 1. Lightweight per-user concurrency guard: prevent spamming multiple requests simultaneously
+  if (userKey !== 'global' && activeUserRequests.has(userKey)) {
+    return res
+      .type('text/plain; charset=utf-8')
+      .status(200)
+      .send('اصبر شوي يا وحش، باقي أرد على رسالتك الأولى! 😂');
+  }
+
+  // 2. Lightweight global concurrency limit: avoid overloading Gemini with concurrent bursts
+  if (activeGlobalRequests >= MAX_GLOBAL_CONCURRENT) {
+    return res
+      .type('text/plain; charset=utf-8')
+      .status(200)
+      .send('الشات زحمة والضغط عالي شوي، ثواني وراجع لكم! 😂');
+  }
+
+  if (userKey !== 'global') {
+    activeUserRequests.add(userKey);
+  }
+  activeGlobalRequests++;
+
   try {
-    const rawQuery = req.query.q;
-    const rawUser = req.query.user;
-    const username = (rawUser && typeof rawUser === 'string' && rawUser.trim()) ? rawUser.trim() : 'global';
-    const userKey = username.toLowerCase();
-
-    // Handle empty query parameter gracefully
-    if (!rawQuery || typeof rawQuery !== 'string' || !rawQuery.trim()) {
-      return res
-        .type('text/plain; charset=utf-8')
-        .status(200)
-        .send('وش تبي تقول؟ اكتب رسالتك بعد الأمر يا غالي 👋');
-    }
-
     // Protect against excessively large inputs
     const userMessage = rawQuery.trim().slice(0, 400);
 
@@ -345,6 +396,11 @@ app.get('/api/ai', async (req, res) => {
       .type('text/plain; charset=utf-8')
       .status(200)
       .send('الـAI مشغول شوي 😂');
+  } finally {
+    if (userKey !== 'global') {
+      activeUserRequests.delete(userKey);
+    }
+    activeGlobalRequests = Math.max(0, activeGlobalRequests - 1);
   }
 });
 
@@ -354,31 +410,53 @@ app.get('/api/ai', async (req, res) => {
  * Returns plain text ONLY
  */
 app.get('/api/answer', async (req, res) => {
+  const rawQuery = req.query.q;
+  const rawUser = req.query.user;
+  const username = (rawUser && typeof rawUser === 'string' && rawUser.trim()) ? rawUser.trim() : 'global';
+  const userKey = username.toLowerCase();
+
+  // Check if viewer provided an answer
+  if (!rawQuery || typeof rawQuery !== 'string' || !rawQuery.trim()) {
+    return res
+      .type('text/plain; charset=utf-8')
+      .status(200)
+      .send('وش جوابك؟ اكتب إجابتك بعد الأمر يا غالي 👋');
+  }
+
+  const userState = getUserState(userKey);
+
+  // Check if there is an active question for this user within validity window
+  if (!userState.lastQuestion || (Date.now() - userState.lastQuestion.askedAt > QUESTION_EXPIRY_MS)) {
+    return res
+      .type('text/plain; charset=utf-8')
+      .status(200)
+      .send('ما عندي سؤال لك الحين 😂');
+  }
+
+  // 1. Lightweight per-user concurrency guard: prevent spamming multiple answers simultaneously
+  if (userKey !== 'global' && activeUserRequests.has(userKey)) {
+    return res
+      .type('text/plain; charset=utf-8')
+      .status(200)
+      .send('اصبر شوي يا وحش، باقي أقيم إجابتك السابقة! 😂');
+  }
+
+  // 2. Lightweight global concurrency limit
+  if (activeGlobalRequests >= MAX_GLOBAL_CONCURRENT) {
+    return res
+      .type('text/plain; charset=utf-8')
+      .status(200)
+      .send('الشات زحمة والضغط عالي شوي، ثواني وراجع لكم! 😂');
+  }
+
+  if (userKey !== 'global') {
+    activeUserRequests.add(userKey);
+  }
+  activeGlobalRequests++;
+
   try {
-    const rawQuery = req.query.q;
-    const rawUser = req.query.user;
-    const username = (rawUser && typeof rawUser === 'string' && rawUser.trim()) ? rawUser.trim() : 'global';
-    const userKey = username.toLowerCase();
-
-    // Check if viewer provided an answer
-    if (!rawQuery || typeof rawQuery !== 'string' || !rawQuery.trim()) {
-      return res
-        .type('text/plain; charset=utf-8')
-        .status(200)
-        .send('وش جوابك؟ اكتب إجابتك بعد الأمر يا غالي 👋');
-    }
-
     // Protect against excessively large inputs
     const answerText = rawQuery.trim().slice(0, 300);
-    const userState = getUserState(userKey);
-
-    // Check if there is an active question for this user within validity window
-    if (!userState.lastQuestion || (Date.now() - userState.lastQuestion.askedAt > QUESTION_EXPIRY_MS)) {
-      return res
-        .type('text/plain; charset=utf-8')
-        .status(200)
-        .send('ما عندي سؤال لك الحين 😂');
-    }
 
     const previousQuestion = userState.lastQuestion.question;
     // Clear question once answered so it is not re-evaluated repeatedly
@@ -426,6 +504,11 @@ app.get('/api/answer', async (req, res) => {
       .type('text/plain; charset=utf-8')
       .status(200)
       .send('الـAI مشغول شوي 😂');
+  } finally {
+    if (userKey !== 'global') {
+      activeUserRequests.delete(userKey);
+    }
+    activeGlobalRequests = Math.max(0, activeGlobalRequests - 1);
   }
 });
 
@@ -708,8 +791,8 @@ app.get('/', (req, res) => {
         <div class="status-value" style="font-family: monospace; font-size: 13px;">${MODEL_NAME}</div>
       </div>
       <div class="status-card">
-        <div class="status-label">نظام الحماية من 503 (Fallback)</div>
-        <div class="status-value" style="font-size: 12px; color: var(--success-text);">مفعل تلقائياً مع نماذج بديلة</div>
+        <div class="status-label">نظام الحماية والتعافي (Fallback)</div>
+        <div class="status-value" style="font-size: 12px; color: var(--success-text);">محاولتان كحد أقصى • تعافي سريع (${FALLBACK_MODEL})</div>
       </div>
       <div class="status-card">
         <div class="status-label">صيغة الرد لشات تويتش</div>
@@ -724,6 +807,7 @@ app.get('/', (req, res) => {
         <span class="chip" onclick="setQuery('مرحبا')">مرحبا</span>
         <span class="chip" onclick="setQuery('وش رايك في جيف؟')">وش رايك في جيف؟</span>
         <span class="chip" onclick="setQuery('وش رايك في جيتو؟')">وش رايك في جيتو؟</span>
+        <span class="chip" onclick="setQuery('وش رايك في عفيفي؟')">وش رايك في عفيفي؟</span>
         <span class="chip" onclick="setQuery('جعفر وش رايك بأوفر واتش؟')">جعفر وش رايك بأوفر واتش؟</span>
         <span class="chip" onclick="setQuery('مين أنت؟')">مين أنت؟</span>
       </div>
