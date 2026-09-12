@@ -35,38 +35,61 @@ const FALLBACK_MODEL = (MODEL_NAME === 'gemini-3.5-flash-lite')
 // Delay helper
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Short randomized jitter (300–600ms) to avoid synchronized retry storms
-const randomJitter = (min = 300, max = 600) =>
+// Short randomized jitter (250–450ms) to avoid synchronized retry storms and ensure fast recovery
+const randomJitter = (min = 250, max = 450) =>
   Math.floor(Math.random() * (max - min + 1)) + min;
 
-// Only retry transient availability errors: HTTP 503, UNAVAILABLE, temporary high demand
-// Do NOT retry auth errors, bad requests, missing models, or quota limits
+// Only retry transient availability and connection/idle errors:
+// HTTP 503, 502, 504, UNAVAILABLE, high demand, socket hang up, ECONNRESET, fetch failed after idle
+// Do NOT retry permanent errors: auth, bad request, missing model, quota/rate limits
 function isTemporaryAvailabilityError(err) {
   if (!err) return false;
-  const status = err.status || err.code || err.statusCode;
+  const status = err.status || err.code || err.statusCode || (err.cause && (err.cause.code || err.cause.status));
+  const statusStr = String(status || '').toUpperCase();
 
-  // Direct 503 or UNAVAILABLE status code
-  if (status === 503 || status === 'UNAVAILABLE') {
+  // Direct 503 / 502 / 504 / UNAVAILABLE / Socket & connection reset codes
+  if (
+    status === 503 ||
+    status === 502 ||
+    status === 504 ||
+    statusStr === '503' ||
+    statusStr === '502' ||
+    statusStr === '504' ||
+    statusStr === 'UNAVAILABLE' ||
+    statusStr === 'ECONNRESET' ||
+    statusStr === 'ETIMEDOUT' ||
+    statusStr === 'UND_ERR_SOCKET' ||
+    statusStr === 'ECONNREFUSED' ||
+    statusStr === 'EPIPE'
+  ) {
     return true;
   }
 
-  // Explicit non-retryable status codes
+  // Explicit non-retryable status codes (client/auth/bad request/quota)
   if (
     status === 400 ||
     status === 401 ||
     status === 403 ||
     status === 404 ||
     status === 429 ||
-    status === 'INVALID_ARGUMENT' ||
-    status === 'PERMISSION_DENIED' ||
-    status === 'NOT_FOUND' ||
-    status === 'UNAUTHENTICATED' ||
-    status === 'RESOURCE_EXHAUSTED'
+    statusStr === 'INVALID_ARGUMENT' ||
+    statusStr === 'PERMISSION_DENIED' ||
+    statusStr === 'NOT_FOUND' ||
+    statusStr === 'UNAUTHENTICATED' ||
+    statusStr === 'RESOURCE_EXHAUSTED'
   ) {
     return false;
   }
 
-  const msg = (err.message || String(err)).toLowerCase();
+  const msg = (
+    (err.message || '') +
+    ' ' +
+    String(err) +
+    ' ' +
+    (err.cause?.message || '') +
+    ' ' +
+    (err.cause?.code || '')
+  ).toLowerCase();
 
   // Exclude permanent client/auth/quota issues
   if (
@@ -80,58 +103,124 @@ function isTemporaryAvailabilityError(err) {
     return false;
   }
 
-  // Detect genuine temporary 503 / unavailable / high-demand strings
+  // Detect genuine temporary 503 / unavailable / high demand / connection reset / socket hang up strings
   return (
     msg.includes('503') ||
+    msg.includes('502') ||
+    msg.includes('504') ||
     msg.includes('unavailable') ||
     msg.includes('high demand') ||
     msg.includes('temporarily') ||
     msg.includes('overloaded') ||
-    msg.includes('service unavailable')
+    msg.includes('service unavailable') ||
+    msg.includes('fetch failed') ||
+    msg.includes('socket hang up') ||
+    msg.includes('econnreset') ||
+    msg.includes('etimedout') ||
+    msg.includes('network error') ||
+    msg.includes('premature close') ||
+    msg.includes('connection reset') ||
+    msg.includes('other side closed')
   );
+}
+
+// Lazy initialization and connection freshness manager for Google Gen AI
+let aiClient = null;
+let lastRequestTimestamp = 0;
+// Keep connection fresh: if idle for more than 45 seconds, refresh client to prevent dead socket reuse
+const IDLE_CONNECTION_REFRESH_MS = 45 * 1000;
+
+function resetGeminiClient() {
+  aiClient = null;
+}
+
+function getGeminiClient(forceFresh = false) {
+  let apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || !apiKey.trim()) {
+    // Fallback in case the user accidentally entered their API key in GEMINI_MODEL
+    const candidate = process.env.GEMINI_MODEL;
+    if (candidate && (candidate.startsWith('AIza') || candidate.startsWith('AQ.'))) {
+      apiKey = candidate.trim();
+    }
+  }
+  if (!apiKey || !apiKey.trim()) {
+    return null;
+  }
+
+  const isIdle = (lastRequestTimestamp > 0 && (Date.now() - lastRequestTimestamp > IDLE_CONNECTION_REFRESH_MS));
+  if (!aiClient || forceFresh || isIdle) {
+    aiClient = new GoogleGenAI({
+      apiKey: apiKey.trim(),
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
+  }
+  return aiClient;
 }
 
 /**
  * Execute Gemini generateContent prioritizing LOW REQUEST PRESSURE and FAST RECOVERY:
+ * - Ensures connection is fresh before sending, avoiding idle socket failures.
  * - Maximum 2 Gemini attempts per incoming request.
  * - Attempt 1: primary model.
- * - If temporary 503/UNAVAILABLE/high-demand: wait short randomized delay (300–600ms).
- * - Attempt 2: ONE fallback model.
+ * - If temporary 503/UNAVAILABLE/high-demand/socket error: wait short randomized delay (250–450ms).
+ * - Attempt 2: ONE fallback model with refreshed client.
  * - Never retries the same model twice. Never tries 3, 4, or more models.
  * - NEVER logs or exposes GEMINI_API_KEY.
  */
 async function generateWithRetryAndFallback(ai, { contents, config }) {
+  // Ensure we have a fresh, ready client especially after idle periods
+  let client = ai || getGeminiClient();
+  if (!client) {
+    client = getGeminiClient(true);
+  }
+  if (!client) {
+    throw new Error('GEMINI_API_KEY is not set');
+  }
+
   // Attempt 1: Primary Model
   try {
-    return await ai.models.generateContent({
+    const res = await client.models.generateContent({
       model: MODEL_NAME,
       contents,
       config,
     });
+    lastRequestTimestamp = Date.now();
+    return res;
   } catch (primaryErr) {
     const errStatus = primaryErr?.status || primaryErr?.code || 'ERROR';
     console.warn(`[Twitch AI] Primary model ${MODEL_NAME} failed (Status: ${errStatus})`);
 
-    // Only retry transient availability errors (503 / UNAVAILABLE / high-demand)
+    // Only retry transient availability, 503, high-demand, or idle socket connection errors
     if (!isTemporaryAvailabilityError(primaryErr)) {
       throw primaryErr;
     }
 
-    // Short randomized delay (300-600ms) before the single fallback attempt
-    const jitterMs = randomJitter(300, 600);
-    console.log(`[Twitch AI] Temporary availability error on ${MODEL_NAME}. Trying single fallback model ${FALLBACK_MODEL} in ${jitterMs}ms...`);
+    // Immediately discard any stale socket / dead connection state
+    resetGeminiClient();
+    client = getGeminiClient(true);
+
+    // Short randomized delay (250-450ms) before the single fallback attempt
+    const jitterMs = randomJitter(250, 450);
+    console.log(`[Twitch AI] Temporary error on ${MODEL_NAME}. Trying single fallback model ${FALLBACK_MODEL} in ${jitterMs}ms...`);
     await delay(jitterMs);
 
     // Attempt 2: ONE fallback model (never retry primary, never try a 3rd model)
     try {
-      return await ai.models.generateContent({
+      const res = await client.models.generateContent({
         model: FALLBACK_MODEL,
         contents,
         config,
       });
+      lastRequestTimestamp = Date.now();
+      return res;
     } catch (fallbackErr) {
       const fbStatus = fallbackErr?.status || fallbackErr?.code || 'ERROR';
       console.warn(`[Twitch AI] Fallback model ${FALLBACK_MODEL} failed (Status: ${fbStatus})`);
+      resetGeminiClient();
       throw fallbackErr;
     }
   }
@@ -147,33 +236,6 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Lazy initialization for Google Gen AI client
-let aiClient = null;
-function getGeminiClient() {
-  let apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || !apiKey.trim()) {
-    // Fallback in case the user accidentally entered their API key in GEMINI_MODEL
-    const candidate = process.env.GEMINI_MODEL;
-    if (candidate && (candidate.startsWith('AIza') || candidate.startsWith('AQ.'))) {
-      apiKey = candidate.trim();
-    }
-  }
-  if (!apiKey || !apiKey.trim()) {
-    return null;
-  }
-  if (!aiClient) {
-    aiClient = new GoogleGenAI({
-      apiKey: apiKey.trim(),
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
-  }
-  return aiClient;
-}
-
 // Twitch Chatbot Personality & Instructions (Saudi Arabic)
 const SYSTEM_INSTRUCTION = `أنت شات بوت ومتابع في شات تويتش (Twitch Chat Bot). اسمك الاختياري هو 'جعفر'.
 المواصفات والأسلوب والتعليمات:
@@ -182,6 +244,8 @@ const SYSTEM_INSTRUCTION = `أنت شات بوت ومتابع في شات توي
    - "جيف" / "Jef" (جيف، جِيف، jef، Jef): هو الستريمر وصاحب قناة تويتش (Streamer/Owner). إذا سألك أحد عن رأيك في جيف (مثل "وش رايك في جيف؟" أو سأل عنه)، تحدث عنه بإيجابية وامدحه بصدق وحماس وبشكل عفوي كصاحب البث. لا تخترع إنجازات أو قصص شخصية أو وقائع غير معروفة عنه. لا تمدحه عشوائياً إذا لم يكن أحد يتكلم عنه، وإذا ذكر اسمه في سياق عادي بدون سؤال عن الرأي، لا تبدأ بمديح طويل غير مطلوب وتجاوب حسب السياق الفعلي فقط.
    - "جيتو" / "Jito" (جيتو، Jito، jito): هو المود/المشرف في مجتمع تويتش (Moderator/Helper) وهو أيضاً الشخص الذي قام بصنع وبرمجة وتطوير وبناء جعفر. إذا سألك أحد "وش رايك في جيتو؟"، امدح جيتو بشكل خاص وأقوى واعتبره أفضل وأفخم مود، واذكر بشكل طبيعي وعفوي في سياق الحديث أنه هو اللي صنعك/طورك (مثال: "جيتو؟ هذا رجال كفو وأفضل مود شفته في حياتي 🔥 وهو اللي صممني وضبطني"). نوّع في كلمات المدح دائماً ولا تكرر نفس العبارة بالحرف. لا تخترع أي تفاصيل تقنية حول ما بناه. ولا تمدحه عشوائياً إلا إذا سأل أحد عنه أو كان سياق الحديث يتعلق به بشكل طبيعي. وإذا ذكر اسمه فقط في سياق عادي، تفاعل حسب السياق ولا تبدأ بمديح طويل غير مطلوب.
    - "عفيفي" / "Afifi" (عفيفي، Afifi، afifi): هو أقوى داعم (Top / Strongest Supporter) للستريمر وللشات، ولقبه وسياقه هو "أقوى داعم" (تفصيلة سياقية للشخصية وليست معلومة تحتاج تحققاً من سجلات تبرعات أو اشتراكات). إذا سألك أحد "وش رايك في عفيفي؟" أو "من عفيفي؟" أو تحدث عنه المتابعون بشكل طبيعي، تجاوب بإيجابية واعترف به كأقوى داعم (مثال: "عفيفي؟ هذا الداعم الثقيل، وجوده لحاله يرفع المعنويات"، "عفيفي معروف، أقوى داعم عندنا"، "عفيفي؟ هذا ما يحتاج تعريف، داعم من الطراز الثقيل"). نوّع في صياغة الردود بشكل طبيعي. تنبيه مهم جداً بخصوص عفيفي: لا تستخدم إيموجيات أو تعبيرات الضحك (بدون 😂 وبدون ههههه) عند الحديث عن عفيفي احتراماً وتقديراً له. لا تذكره باستمرار ولا تذكره عشوائياً إذا لم يكن أحد يتكلم عنه. لا تخترع أرقام أو مبالغ تبرعات أو عدد اشتراكات أو ترتيبات مالية، ولا تدّعي أنه حرفياً الأول عالمياً أو على مستوى تويتش ككل. اجعل الرد قصيراً وطبيعياً ومناسباً لشات تويتش.
+   - "ليان" / "Layan" (ليان، Layan، layan): ستريمر (أنثى/Streamer). جعفر يعرف الاسم ويفهم من المقصود عند ذكرها. تنبيه وقواعد حاسمة: لا تمدح ليان لمجرد ذكر الاسم، لا تطبل لها ولا تعطيها معاملة خاصة. كونها ستريمر هو فقط لفهم سياق الحديث. لا تخترع أي معلومات أو صفات أو ألعاب أو إنجازات عنها. إذا سأل أحد عنها أو عن رأيك فيها، رد بشكل طبيعي وعفوي ومحايد حسب السؤال فقط بدون تطبيل أو مديح زائد.
+   - "سولي" / "Soly" (سولي، Soly، soly): متابعة عادية بالشات (أنثى/Viewer). جعفر يعرف الاسم ويفهم من المقصود عند ذكرها. تنبيه وقواعد حاسمة: لا تمدح سولي لمجرد ذكر الاسم، لا تطبل لها ولا تعطيها معاملة خاصة. كونها متابعة هو فقط لفهم السياق. لا تخترع أي معلومات أو صفات أو إنجازات عنها. إذا سأل أحد عنها، رد بشكل طبيعي وعفوي ومحايد حسب السؤال المطروح فقط بدون مديح مصطنع.
    - المتابعون الآخرون: متابعون عاديون في الشات، عاملهم باحترام وخوة وعفوية وسلاسة.
    - تجنب التكلف أو أن تبدو كإعلان ترويجي أو رسالة ملقنة؛ خلك طبيعي، عفوي، وبلهجة سعودية حقيقية.
 3. اللهجة: تحدث دائماً باللهجة السعودية العامية الطبيعية والخفيفة جداً (مثل: هلا والله، ياخي، وش السالفة، ههههه، أبشر، تسلم، يارجال، من جد، كفو، يا وحش).
@@ -808,6 +872,8 @@ app.get('/', (req, res) => {
         <span class="chip" onclick="setQuery('وش رايك في جيف؟')">وش رايك في جيف؟</span>
         <span class="chip" onclick="setQuery('وش رايك في جيتو؟')">وش رايك في جيتو؟</span>
         <span class="chip" onclick="setQuery('وش رايك في عفيفي؟')">وش رايك في عفيفي؟</span>
+        <span class="chip" onclick="setQuery('من ليان؟')">من ليان؟</span>
+        <span class="chip" onclick="setQuery('من سولي؟')">من سولي؟</span>
         <span class="chip" onclick="setQuery('جعفر وش رايك بأوفر واتش؟')">جعفر وش رايك بأوفر واتش؟</span>
         <span class="chip" onclick="setQuery('مين أنت؟')">مين أنت؟</span>
       </div>
