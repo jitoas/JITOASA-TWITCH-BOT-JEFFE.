@@ -10,14 +10,16 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Default Gemini Flash model (easily configurable via GEMINI_MODEL env var)
-// gemini-3.1-flash-lite is fast, free-tier friendly, and available to new users
+// gemini-3.1-flash-lite is fast, free-tier friendly, and verified available
 const DEFAULT_MODEL = 'gemini-3.1-flash-lite';
 
-// Free & fast fallback models available through the same Gemini API key
-const FALLBACK_MODELS_POOL = [
+// Verified active, fast, free-tier compatible Gemini models for ordered fallback
+const ORDERED_FALLBACK_MODELS = [
   'gemini-3.5-flash-lite',
   'gemini-flash-lite-latest',
-  'gemini-3.1-flash-lite',
+  'gemini-3.5-flash',
+  'gemini-3.6-flash',
+  'gemini-flash-latest',
 ];
 
 function resolveModelName(raw) {
@@ -33,8 +35,12 @@ function resolveModelName(raw) {
 
 const MODEL_NAME = resolveModelName(process.env.GEMINI_MODEL);
 
-// Brief delay helper for retrying on temporary errors (500–1000ms)
+// Delay helper
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Short randomized jitter (300–800ms) to avoid synchronized retry storms
+const randomJitter = (min = 300, max = 800) =>
+  Math.floor(Math.random() * (max - min + 1)) + min;
 
 // Detect temporary service errors: 503 UNAVAILABLE, High Demand, Rate Limits
 function isTemporaryServiceError(err) {
@@ -57,65 +63,50 @@ function isTemporaryServiceError(err) {
 }
 
 /**
- * Execute Gemini generateContent with automatic retry on 503 / temporary service errors
- * and graceful fallback across free-tier models. Capped at 2–3 total attempts per request.
- * NEVER logs or exposes GEMINI_API_KEY.
+ * Execute Gemini generateContent with strong, fast fallback against 503 / UNAVAILABLE / high-demand errors.
+ * - Does not repeatedly hammer the same busy model.
+ * - If a model encounters 503 / high-demand, it moves quickly to the next fallback model after a short randomized delay (300-800ms).
+ * - Capped at 3 attempts total to prevent latency spikes in Twitch chat.
+ * - NEVER logs or exposes GEMINI_API_KEY.
  */
 async function generateWithRetryAndFallback(ai, { contents, config }) {
   const primaryModel = MODEL_NAME;
-  const fallbackCandidates = FALLBACK_MODELS_POOL.filter((m) => m !== primaryModel);
+  // Build unique ordered list starting with primaryModel, followed by ordered fallbacks
+  const modelChain = [
+    primaryModel,
+    ...ORDERED_FALLBACK_MODELS.filter((m) => m !== primaryModel),
+  ];
 
   let attempts = 0;
   const maxAttempts = 3;
   let lastError = null;
 
-  // Attempt 1: Try Primary Model
-  try {
-    attempts++;
-    return await ai.models.generateContent({
-      model: primaryModel,
-      contents,
-      config,
-    });
-  } catch (err) {
-    lastError = err;
-    const errStatus = err?.status || err?.code || 'ERROR';
-    console.warn(`[Twitch AI] Primary model ${primaryModel} failed on attempt ${attempts} (${errStatus}):`, err?.message || err);
-
-    // If temporary error (503 UNAVAILABLE, high demand), wait 750ms and retry primary model once
-    if (isTemporaryServiceError(err) && attempts < maxAttempts) {
-      console.log(`[Twitch AI] Temporary error detected on ${primaryModel}. Waiting 750ms before retry...`);
-      await delay(750);
-      try {
-        attempts++;
-        return await ai.models.generateContent({
-          model: primaryModel,
-          contents,
-          config,
-        });
-      } catch (retryErr) {
-        lastError = retryErr;
-        const retryStatus = retryErr?.status || retryErr?.code || 'ERROR';
-        console.warn(`[Twitch AI] Retry on primary model ${primaryModel} failed on attempt ${attempts} (${retryStatus}):`, retryErr?.message || retryErr);
-      }
-    }
-  }
-
-  // Attempt Fallback: Try alternative free models if primary failed
-  for (const fallbackModel of fallbackCandidates) {
+  for (const currentModel of modelChain) {
     if (attempts >= maxAttempts) break;
     attempts++;
-    console.log(`[Twitch AI] Attempting fallback model (${attempts}/${maxAttempts}): ${fallbackModel}`);
+
     try {
+      if (attempts > 1) {
+        console.log(`[Twitch AI] Attempting fallback model (${attempts}/${maxAttempts}): ${currentModel}`);
+      }
       return await ai.models.generateContent({
-        model: fallbackModel,
+        model: currentModel,
         contents,
         config,
       });
-    } catch (fallbackErr) {
-      lastError = fallbackErr;
-      const fbStatus = fallbackErr?.status || fallbackErr?.code || 'ERROR';
-      console.warn(`[Twitch AI] Fallback model ${fallbackModel} failed (${fbStatus}):`, fallbackErr?.message || fallbackErr);
+    } catch (err) {
+      lastError = err;
+      const errStatus = err?.status || err?.code || 'ERROR';
+      const errMsg = err?.message || String(err);
+      console.warn(`[Twitch AI] Model ${currentModel} failed on attempt ${attempts}/${maxAttempts} (${errStatus}):`, errMsg);
+
+      // If temporary high-demand / 503 / UNAVAILABLE error and we still have attempts left:
+      // Move quickly to the NEXT fallback model rather than retrying the same busy model.
+      if (isTemporaryServiceError(err) && attempts < maxAttempts) {
+        const jitterMs = randomJitter(300, 800);
+        console.log(`[Twitch AI] Model ${currentModel} experienced temporary service error (${errStatus}). Moving to next fallback model in ${jitterMs}ms...`);
+        await delay(jitterMs);
+      }
     }
   }
 
@@ -155,16 +146,17 @@ function getGeminiClient() {
 }
 
 // Twitch Chatbot Personality & Instructions (Saudi Arabic)
-const SYSTEM_INSTRUCTION = `أنت شات بوت ومتابع في شات تويتش (Twitch Chat Bot).
+const SYSTEM_INSTRUCTION = `أنت شات بوت ومتابع في شات تويتش (Twitch Chat Bot). اسمك الاختياري هو 'جعفر'.
 المواصفات والأسلوب والتعليمات:
-1. اللهجة: تحدث دائماً باللهجة السعودية العامية الطبيعية والخفيفة جداً (مثل: هلا والله، ياخي، وش السالفة، ههههه، أبشر، تسلم، يارجال، من جد، كفو).
-2. الشات السريع: الردود تكون قصيرة ومباشرة ومناسبة لسرعة شات تويتش (جملة أو جملتين فقط، بحد أقصى 150 حرف)، وتجنب الإطالة تماماً.
-3. الروح والأسلوب: خلك ودود وعفوي، تمزح وتطقطق بخفة وبدون إزعاج أو ثقل دم، ولا تتكلم برسمية ولا كأنك روبوت أو نظام ذكاء اصطناعي.
-4. عفوية الحديث: لا تحول كل محادثة لسؤال أو اختبار؛ سولف مع المتابعين بشكل طبيعي ولا تختم كل رد بسؤال موجه لهم.
-5. التفاعل وتقييم الإجابات (قابل للتوسع لنظام الإجابات وأمر !a): إذا كان كلام المتابع إجابة على سؤال سابق طُرح في البث أو الشات، حاول تقييم إجابته بخفة ولطف ووضّح إذا كانت صحيحة أو خطأ إذا كان بالإمكان التحقق من صحتها.
-6. المصداقية: لا تخترع معلومات أو تواريخ أو قصص على أنها حقائق مؤكدة؛ وإذا ما كنت متأكد من معلومة، قل بكل بساطة وعفوية إنك مو متأكد.
-7. التنوع: تجنب تكرار نفس الكلمات أو العبارات في كل رد، ونوّع في أسلوبك دائماً.
-8. الصيغة النهائية: أرجع نصاً عادياً فقط (Plain Text) بدون أي تنسيق Markdown (بدون نجوم *، بدون #، بدون شرطات أو علامات تنصيص)، ليكون متوافقاً تماماً مع Nightbot وتويتش.`;
+1. الاسم والهوية: اسمك 'جعفر'. تنبيه وقاعدة أساسية: لا تقدم نفسك باستمرار باسم جعفر، ولا تقل 'أنا جعفر' إلا إذا استدعى سياق الحديث ذلك بشكل طبيعي تماماً. في الرسائل العادية تصرّف كشات بوت تويتش العادي بدون حشر اسمك. إذا ناداك المتابع أو خاطبك صراحة بقوله 'جعفر'، 'يا جعفر'، أو ذكر 'جعفر' في رسالته، افهم مباشرة أنه يخاطبك أنت شخصياً وتجاوب معه بعفوية وسلاسة وبأسلوبك المعتاد. لا تجعل الحديث متمحوراً حول اسمك.
+2. اللهجة: تحدث دائماً باللهجة السعودية العامية الطبيعية والخفيفة جداً (مثل: هلا والله، ياخي، وش السالفة، ههههه، أبشر، تسلم، يارجال، من جد، كفو).
+3. الشات السريع: الردود تكون قصيرة ومباشرة ومناسبة لسرعة شات تويتش (جملة أو جملتين فقط، بحد أقصى 150 حرف)، وتجنب الإطالة تماماً.
+4. الروح والأسلوب: خلك ودود وعفوي، تمزح وتطقطق بخفة وبدون إزعاج أو ثقل دم، ولا تتكلم برسمية ولا كأنك روبوت أو نظام ذكاء اصطناعي.
+5. عفوية الحديث: لا تحول كل محادثة لسؤال أو اختبار؛ سولف مع المتابعين بشكل طبيعي ولا تختم كل رد بسؤال موجه لهم.
+6. التفاعل وتقييم الإجابات (قابل للتوسع لنظام الإجابات وأمر !a): إذا كان كلام المتابع إجابة على سؤال سابق طُرح في البث أو الشات، حاول تقييم إجابته بخفة ولطف ووضّح إذا كانت صحيحة أو خطأ إذا كان بالإمكان التحقق من صحتها.
+7. المصداقية: لا تخترع معلومات أو تواريخ أو قصص على أنها حقائق مؤكدة؛ وإذا ما كنت متأكد من معلومة، قل بكل بساطة وعفوية إنك مو متأكد.
+8. التنوع: تجنب تكرار نفس الكلمات أو العبارات في كل رد، ونوّع في أسلوبك دائماً.
+9. الصيغة النهائية: أرجع نصاً عادياً فقط (Plain Text) بدون أي تنسيق Markdown (بدون نجوم *، بدون #، بدون شرطات أو علامات تنصيص)، ليكون متوافقاً تماماً مع Nightbot وتويتش.`;
 
 // Answer evaluation system instruction for !a
 const ANSWER_EVALUATION_INSTRUCTION = `أنت شات بوت ومتابع في شات تويتش (Twitch Chat Bot).
@@ -727,7 +719,7 @@ app.get('/', (req, res) => {
         <span class="chip" onclick="setQuery('مرحبا')">مرحبا</span>
         <span class="chip" onclick="setQuery('وش تسوي؟')">وش تسوي؟</span>
         <span class="chip" onclick="setQuery('هلا والله')">هلا والله</span>
-        <span class="chip" onclick="setQuery('من فاز أمس؟')">من فاز أمس؟</span>
+        <span class="chip" onclick="setQuery('جعفر وش رايك بأوفر واتش؟')">جعفر وش رايك بأوفر واتش؟</span>
         <span class="chip" onclick="setQuery('مين أنت؟')">مين أنت؟</span>
       </div>
       <div class="form-group">
