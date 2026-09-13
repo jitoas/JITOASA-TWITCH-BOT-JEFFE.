@@ -355,7 +355,7 @@ async function prepareJaafarChatReplyPipeline({ chatEvent, analysis, record }) {
 
   promptText += 'رد عليه بأسلوب جعفر العفوي والمحبوب، وبشكل مختصر جداً مناسب للشات.';
 
-  const isGeminiReady = Boolean(getAiClient());
+  const isGeminiReady = Boolean(getGeminiClient());
   console.log(`[Jaafar Pipeline] Retrieval & Prompt Ready (${promptText.length} chars). Gemini Ready: ${isGeminiReady}. Auto-reply is OFF. Armed and ready for Phase 2.`);
 
   if (!AUTO_REPLY_TO_TWITCH_CHAT) {
@@ -1003,6 +1003,13 @@ function getGeminiClient(forceFresh = false) {
 }
 
 /**
+ * Compatibility alias for getGeminiClient
+ */
+function getAiClient(forceFresh = false) {
+  return getGeminiClient(forceFresh);
+}
+
+/**
  * Execute Gemini generateContent prioritizing LOW REQUEST PRESSURE and FAST RECOVERY:
  * - Ensures connection is fresh before sending, avoiding idle socket failures.
  * - Maximum 2 Gemini attempts per incoming request.
@@ -1133,6 +1140,63 @@ function getUserState(userKey) {
   }
   state.lastActive = Date.now();
   return state;
+}
+
+/**
+ * Retrieves chat history for a given Twitch chatter from user memory
+ */
+function getUserHistory(userLogin) {
+  if (!userLogin) return [];
+  const key = String(userLogin).toLowerCase().trim();
+  const state = userMemoryMap.get(key);
+  if (!state || !Array.isArray(state.history)) return [];
+  return state.history.map(item => {
+    let text = '';
+    if (typeof item.text === 'string') {
+      text = item.text;
+    } else if (Array.isArray(item.parts)) {
+      text = item.parts.map(p => p.text || '').join(' ');
+    }
+    return {
+      role: item.role === 'model' || item.role === 'assistant' ? 'assistant' : 'user',
+      text,
+    };
+  });
+}
+
+/**
+ * Records a chat interaction into user memory
+ */
+function recordUserTurn(userLogin, userText, botText) {
+  if (!userLogin) return;
+  const key = String(userLogin).toLowerCase().trim();
+  const state = getUserState(key);
+  state.history.push({ role: 'user', parts: [{ text: userText }] });
+  state.history.push({ role: 'model', parts: [{ text: botText }] });
+  if (state.history.length > MAX_HISTORY_MESSAGES) {
+    state.history = state.history.slice(-MAX_HISTORY_MESSAGES);
+  }
+}
+
+/**
+ * Executes Gemini generation with personality instruction and recovery
+ */
+async function executeGeminiWithRecovery({ prompt, systemInstruction = SYSTEM_INSTRUCTION }) {
+  const client = getGeminiClient();
+  if (!client) {
+    throw new Error('GEMINI_API_KEY is not set');
+  }
+  const response = await generateWithRetryAndFallback(client, {
+    contents: prompt,
+    config: {
+      systemInstruction,
+      temperature: 0.7,
+      maxOutputTokens: 150,
+    },
+  });
+  return {
+    text: sanitizeForTwitch(response.text) || '',
+  };
 }
 
 // Common rhetorical greetings that shouldn't be treated as trivia/quiz questions
@@ -1900,7 +1964,7 @@ app.get('/api/twitch/chat/status', (req, res) => {
       canDetectReplies: true,
       hasStreamSessionMemory: true,
       hasUserMemory: true,
-      geminiReady: Boolean(getAiClient()),
+      geminiReady: Boolean(getGeminiClient()),
       autoReplyEnabled: AUTO_REPLY_TO_TWITCH_CHAT,
     },
     stats: {
