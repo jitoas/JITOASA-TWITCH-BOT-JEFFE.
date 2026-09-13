@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import crypto from 'crypto';
 import { GoogleGenAI } from '@google/genai';
 
 // Load environment variables from .env if available
@@ -8,6 +9,90 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Twitch OAuth Configuration for Bot Account (جعفر)
+const TWITCH_CLIENT_ID = (process.env.TWITCH_CLIENT_ID || '').trim();
+const TWITCH_CLIENT_SECRET = (process.env.TWITCH_CLIENT_SECRET || '').trim();
+const TWITCH_REDIRECT_URI = (process.env.TWITCH_REDIRECT_URI || '').trim() || 'https://twitch-bot-jeffe.onrender.com/auth/twitch/callback';
+const TWITCH_SCOPES = ['user:read:chat', 'user:write:chat', 'user:bot'];
+
+// In-Memory OAuth state store to guard against CSRF attacks with TTL (10 minutes)
+const oauthStateStore = new Map();
+const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+
+function cleanupExpiredOAuthStates() {
+  const now = Date.now();
+  for (const [state, info] of oauthStateStore.entries()) {
+    if (now - info.createdAt > OAUTH_STATE_TTL_MS) {
+      oauthStateStore.delete(state);
+    }
+  }
+}
+
+// In-Memory Twitch authentication state for bot account "جعفر"
+// Kept in server memory, ready for Phase 2 (EventSub, Chat reading/writing)
+let twitchAuthState = {
+  authorized: false,
+  user: null, // { id, login, displayName, profileImageUrl }
+  scopes: [],
+  expiresAt: 0,
+  accessToken: null,
+  refreshToken: null,
+  connectedAt: null,
+};
+
+/**
+ * Safely refresh Twitch access token using refresh_token when needed
+ * Ready for future phases (sending messages, EventSub, chat listening)
+ */
+async function refreshTwitchTokenIfNeeded() {
+  if (!twitchAuthState.authorized || !twitchAuthState.refreshToken) {
+    return null;
+  }
+  // Refresh 2 minutes before expiry
+  if (Date.now() < (twitchAuthState.expiresAt - 2 * 60 * 1000)) {
+    return twitchAuthState.accessToken;
+  }
+  if (!TWITCH_CLIENT_ID || !TWITCH_CLIENT_SECRET) {
+    console.warn('[Twitch OAuth] Cannot refresh token: credentials missing in environment');
+    return null;
+  }
+
+  try {
+    const params = new URLSearchParams({
+      client_id: TWITCH_CLIENT_ID,
+      client_secret: TWITCH_CLIENT_SECRET,
+      grant_type: 'refresh_token',
+      refresh_token: twitchAuthState.refreshToken,
+    });
+
+    const response = await fetch('https://id.twitch.tv/oauth2/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: params.toString(),
+    });
+
+    if (!response.ok) {
+      console.error(`[Twitch OAuth] Token refresh failed with status: ${response.status}`);
+      return null;
+    }
+
+    const data = await response.json();
+    twitchAuthState.accessToken = data.access_token;
+    if (data.refresh_token) {
+      twitchAuthState.refreshToken = data.refresh_token;
+    }
+    twitchAuthState.expiresAt = Date.now() + (data.expires_in * 1000);
+    twitchAuthState.scopes = data.scope || twitchAuthState.scopes;
+    console.log('[Twitch OAuth] Token refreshed successfully for user:', twitchAuthState.user?.login || 'bot');
+    return twitchAuthState.accessToken;
+  } catch (err) {
+    console.error('[Twitch OAuth] Error refreshing token:', err?.message || err);
+    return null;
+  }
+}
 
 // Default Gemini Flash model (easily configurable via GEMINI_MODEL env var)
 // gemini-3.1-flash-lite is fast, free-tier friendly, and verified available
@@ -577,7 +662,431 @@ app.get('/api/answer', async (req, res) => {
 });
 
 /**
- * Root route: Provides interactive tester and Nightbot setup instructions
+ * ============================================================================
+ * Twitch OAuth Endpoints for Bot Account (جعفر)
+ * Modern Scopes: user:read:chat user:write:chat user:bot
+ * ============================================================================
+ */
+
+/**
+ * GET /auth/twitch
+ * Initiates the Twitch OAuth authorization flow with a cryptographically
+ * secure random state (CSRF protection) and temporary TTL storage.
+ */
+app.get('/auth/twitch', (req, res) => {
+  if (!TWITCH_CLIENT_ID) {
+    return res.status(500).type('html').send(`<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <title>إعدادات Twitch Client ID مفقودة</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #F9FAFB; padding: 40px 20px; display: flex; justify-content: center; color: #111827; }
+    .card { background: white; border: 1px solid #E5E7EB; border-radius: 12px; padding: 28px; max-width: 540px; width: 100%; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    h2 { color: #DC2626; margin-bottom: 12px; font-size: 18px; }
+    p { color: #4B5563; font-size: 14px; line-height: 1.6; margin-bottom: 14px; }
+    code { background: #F3F4F6; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 13px; color: #111827; }
+    a { display: inline-block; background: #111827; color: white; text-decoration: none; padding: 8px 16px; border-radius: 6px; font-size: 13px; font-weight: 500; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>⚠️ إعدادات Twitch مفقودة</h2>
+    <p>لم يتم تعيين <code>TWITCH_CLIENT_ID</code> في متغيرات البيئة (Environment Variables) في Render.</p>
+    <p>يرجى إضافة <code>TWITCH_CLIENT_ID</code> و <code>TWITCH_CLIENT_SECRET</code> و <code>TWITCH_REDIRECT_URI</code> ثم إعادة تشغيل السيرفر.</p>
+    <a href="/">العودة إلى لوحة التحكم</a>
+  </div>
+</body>
+</html>`);
+  }
+
+  // Clean up any stale states before generating a new one
+  cleanupExpiredOAuthStates();
+
+  // Generate cryptographically secure state
+  const state = crypto.randomBytes(24).toString('hex');
+  oauthStateStore.set(state, { createdAt: Date.now() });
+
+  const authParams = new URLSearchParams({
+    client_id: TWITCH_CLIENT_ID,
+    redirect_uri: TWITCH_REDIRECT_URI,
+    response_type: 'code',
+    scope: TWITCH_SCOPES.join(' '),
+    state: state,
+    force_verify: 'true',
+  });
+
+  const authorizeUrl = `https://id.twitch.tv/oauth2/authorize?${authParams.toString()}`;
+  return res.redirect(authorizeUrl);
+});
+
+/**
+ * GET /auth/twitch/callback
+ * Receives the authorization code, validates the state to prevent CSRF,
+ * exchanges code for tokens, retrieves user account details, and renders
+ * a success view without ever leaking tokens to logs or the browser.
+ */
+app.get('/auth/twitch/callback', async (req, res) => {
+  const { code, state, error, error_description } = req.query;
+
+  // 1. Handle error returned by Twitch (e.g. user canceled/denied)
+  if (error) {
+    console.warn(`[Twitch OAuth] Authorization denied by user: ${error} - ${error_description || ''}`);
+    return res.status(400).type('html').send(`<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <title>تم إلغاء التفويض</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #F9FAFB; padding: 40px 20px; display: flex; justify-content: center; color: #111827; }
+    .card { background: white; border: 1px solid #E5E7EB; border-radius: 12px; padding: 28px; max-width: 520px; width: 100%; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    h2 { color: #DC2626; margin-bottom: 12px; font-size: 18px; }
+    p { color: #4B5563; font-size: 14px; line-height: 1.6; margin-bottom: 16px; }
+    a { display: inline-block; background: #111827; color: white; text-decoration: none; padding: 8px 16px; border-radius: 6px; font-size: 13px; font-weight: 500; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>تم إلغاء عملية التفويض من Twitch</h2>
+    <p>تم رفض أو إلغاء التفويض: ${error_description || error || 'لم يكتمل التفويض'}. يمكنك المحاولة مجدداً في أي وقت.</p>
+    <a href="/">العودة إلى لوحة التحكم</a>
+  </div>
+</body>
+</html>`);
+  }
+
+  // 2. Validate state to prevent CSRF attacks
+  if (!state || typeof state !== 'string' || !oauthStateStore.has(state)) {
+    console.warn('[Twitch OAuth] Invalid or expired state received in callback');
+    return res.status(400).type('html').send(`<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <title>حالة الأمان غير صالحة</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #F9FAFB; padding: 40px 20px; display: flex; justify-content: center; color: #111827; }
+    .card { background: white; border: 1px solid #E5E7EB; border-radius: 12px; padding: 28px; max-width: 520px; width: 100%; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    h2 { color: #DC2626; margin-bottom: 12px; font-size: 18px; }
+    p { color: #4B5563; font-size: 14px; line-height: 1.6; margin-bottom: 16px; }
+    a { display: inline-block; background: #111827; color: white; text-decoration: none; padding: 8px 16px; border-radius: 6px; font-size: 13px; font-weight: 500; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>⚠️ فشل التحقق من حالة الأمان (Invalid OAuth State)</h2>
+    <p>جلسة التفويض غير صالحة أو انتهت مدتها للحماية من هجمات تزوير الطلبات (CSRF). يرجى بدء عملية الربط من جديد.</p>
+    <a href="/auth/twitch">إعادة محاولة الربط</a>
+  </div>
+</body>
+</html>`);
+  }
+
+  // Consume state immediately so it cannot be reused
+  oauthStateStore.delete(state);
+
+  // 3. Verify authorization code is present
+  if (!code || typeof code !== 'string') {
+    return res.status(400).type('text/plain; charset=utf-8').send('كود التفويض مفقود');
+  }
+
+  if (!TWITCH_CLIENT_SECRET) {
+    console.error('[Twitch OAuth] TWITCH_CLIENT_SECRET is missing in environment variables');
+    return res.status(500).type('text/plain; charset=utf-8').send('TWITCH_CLIENT_SECRET is not configured on the server');
+  }
+
+  try {
+    // 4. Exchange authorization code for access_token and refresh_token
+    const tokenParams = new URLSearchParams({
+      client_id: TWITCH_CLIENT_ID,
+      client_secret: TWITCH_CLIENT_SECRET,
+      code: code,
+      grant_type: 'authorization_code',
+      redirect_uri: TWITCH_REDIRECT_URI,
+    });
+
+    const tokenResponse = await fetch('https://id.twitch.tv/oauth2/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: tokenParams.toString(),
+    });
+
+    if (!tokenResponse.ok) {
+      console.error(`[Twitch OAuth] Token exchange failed with HTTP ${tokenResponse.status}`);
+      return res.status(500).type('html').send(`<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <title>خطأ في استبدال الرمز</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #F9FAFB; padding: 40px 20px; display: flex; justify-content: center; color: #111827; }
+    .card { background: white; border: 1px solid #E5E7EB; border-radius: 12px; padding: 28px; max-width: 520px; width: 100%; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    h2 { color: #DC2626; margin-bottom: 12px; font-size: 18px; }
+    p { color: #4B5563; font-size: 14px; line-height: 1.6; margin-bottom: 16px; }
+    a { display: inline-block; background: #111827; color: white; text-decoration: none; padding: 8px 16px; border-radius: 6px; font-size: 13px; font-weight: 500; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>فشل استبدال رمز التفويض مع Twitch</h2>
+    <p>حدث خطأ أثناء الاتصال بسيرفرات Twitch (HTTP ${tokenResponse.status}). يرجى التأكد من تطابق الـ Redirect URI وصحة الـ Client Secret.</p>
+    <a href="/">العودة إلى لوحة التحكم</a>
+  </div>
+</body>
+</html>`);
+    }
+
+    const tokenData = await tokenResponse.json();
+
+    // 5. Fetch Twitch user profile for the authorized account
+    const userResponse = await fetch('https://api.twitch.tv/helix/users', {
+      method: 'GET',
+      headers: {
+        'Client-Id': TWITCH_CLIENT_ID,
+        'Authorization': `Bearer ${tokenData.access_token}`,
+      },
+    });
+
+    let userData = null;
+    if (userResponse.ok) {
+      const userPayload = await userResponse.json();
+      if (userPayload.data && userPayload.data.length > 0) {
+        userData = userPayload.data[0];
+      }
+    }
+
+    const accountLogin = userData ? userData.login : 'jaafar';
+    const accountDisplayName = userData ? userData.display_name : 'جعفر';
+    const accountId = userData ? userData.id : '';
+    const profileImage = userData ? userData.profile_image_url : '';
+
+    // 6. Save authentication state securely in server memory
+    // NEVER expose accessToken or refreshToken to logs or client HTML
+    twitchAuthState = {
+      authorized: true,
+      user: {
+        id: accountId,
+        login: accountLogin,
+        displayName: accountDisplayName,
+        profileImageUrl: profileImage,
+      },
+      scopes: tokenData.scope || TWITCH_SCOPES,
+      expiresAt: Date.now() + (tokenData.expires_in * 1000),
+      accessToken: tokenData.access_token,
+      refreshToken: tokenData.refresh_token,
+      connectedAt: new Date().toISOString(),
+    };
+
+    console.log(`[Twitch OAuth] Successfully authorized Twitch account: @${accountLogin} (${accountDisplayName})`);
+
+    // 7. Render simple, polished success view
+    return res.type('html').send(`<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>تم ربط حساب تويتش بنجاح</title>
+  <style>
+    :root {
+      --bg: #F9FAFB;
+      --card: #FFFFFF;
+      --border: #E5E7EB;
+      --text: #111827;
+      --text-muted: #6B7280;
+      --success: #10B981;
+      --success-bg: #ECFDF5;
+      --success-border: #D1FAE5;
+      --primary: #111827;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 40px 20px;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 36px 32px;
+      max-width: 500px;
+      width: 100%;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+      text-align: center;
+    }
+    .avatar {
+      width: 80px;
+      height: 80px;
+      border-radius: 50%;
+      margin: 0 auto 16px auto;
+      border: 3px solid #9146FF;
+      display: block;
+      object-fit: cover;
+    }
+    .avatar-fallback {
+      width: 80px;
+      height: 80px;
+      border-radius: 50%;
+      margin: 0 auto 16px auto;
+      background: #9146FF;
+      color: white;
+      font-size: 32px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--success-bg);
+      color: #065F46;
+      border: 1px solid var(--success-border);
+      padding: 4px 12px;
+      border-radius: 9999px;
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 12px;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      background: var(--success);
+      border-radius: 50%;
+    }
+    h1 {
+      font-size: 20px;
+      font-weight: 700;
+      margin-bottom: 6px;
+      color: var(--text);
+    }
+    p.desc {
+      color: var(--text-muted);
+      font-size: 14px;
+      line-height: 1.6;
+      margin-bottom: 24px;
+    }
+    .info-list {
+      background: #F9FAFB;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 18px;
+      margin-bottom: 24px;
+      text-align: right;
+      font-size: 13px;
+    }
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 7px 0;
+      border-bottom: 1px solid #F3F4F6;
+    }
+    .info-row:last-child { border-bottom: none; }
+    .info-label { color: var(--text-muted); font-size: 12px; }
+    .info-val { font-weight: 600; color: var(--text); }
+    .actions {
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    a.btn {
+      display: inline-block;
+      background: var(--primary);
+      color: white;
+      text-decoration: none;
+      padding: 10px 20px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    a.btn-secondary {
+      background: white;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    ${profileImage ? `<img src="${profileImage}" alt="${accountDisplayName}" class="avatar" />` : `<div class="avatar-fallback">${accountDisplayName.charAt(0)}</div>`}
+    <div class="badge"><span class="dot"></span> تم الربط بنجاح</div>
+    <h1>حساب ${accountDisplayName} جاهز</h1>
+    <p class="desc">تم تفويض وتوثيق حساب تويتش بنجاح عبر OAuth. السيرفر الآن يمتلك صلاحيات الشات اللازمة لبوت جعفر.</p>
+    
+    <div class="info-list">
+      <div class="info-row">
+        <span class="info-label">اسم الحساب:</span>
+        <span class="info-val">${accountDisplayName} (@${accountLogin})</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">معرف المستخدم (ID):</span>
+        <span class="info-val" style="font-family: monospace;">${accountId || 'غير متوفر'}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">الصلاحيات:</span>
+        <span class="info-val" style="font-family: monospace; font-size: 11px;">user:read:chat user:write:chat user:bot</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">تخزين التوكن:</span>
+        <span class="info-val" style="color: #065F46;">محفوظ بأمان في الذاكرة ✓</span>
+      </div>
+    </div>
+
+    <div class="actions">
+      <a href="/" class="btn">لوحة التحكم الرئيسية</a>
+      <a href="/auth/twitch/status" class="btn btn-secondary" target="_blank">فحص حالة JSON</a>
+    </div>
+  </div>
+</body>
+</html>`);
+  } catch (err) {
+    console.error('[Twitch OAuth] Unexpected error in callback:', err?.message || err);
+    return res.status(500).type('text/plain; charset=utf-8').send('حدث خطأ غير متوقع أثناء معالجة تفويض تويتش.');
+  }
+});
+
+/**
+ * GET /auth/twitch/status
+ * Returns JSON showing whether Twitch is currently authorized or not,
+ * with account identity details. Never exposes access or refresh tokens.
+ */
+app.get('/auth/twitch/status', (req, res) => {
+  if (twitchAuthState.authorized && twitchAuthState.user) {
+    const expiresInSeconds = Math.max(0, Math.round((twitchAuthState.expiresAt - Date.now()) / 1000));
+    return res.status(200).json({
+      authorized: true,
+      account: {
+        id: twitchAuthState.user.id,
+        login: twitchAuthState.user.login,
+        displayName: twitchAuthState.user.displayName,
+        profileImageUrl: twitchAuthState.user.profileImageUrl || null,
+      },
+      scopes: twitchAuthState.scopes,
+      connectedAt: twitchAuthState.connectedAt,
+      tokenExpiresInSeconds: expiresInSeconds,
+    });
+  }
+
+  return res.status(200).json({
+    authorized: false,
+    message: 'حساب تويتش غير مفوض حالياً. توجه إلى /auth/twitch لربط الحساب.',
+    configuredClientId: Boolean(TWITCH_CLIENT_ID),
+    configuredClientSecret: Boolean(TWITCH_CLIENT_SECRET),
+    redirectUri: TWITCH_REDIRECT_URI,
+  });
+});
+
+/**
+ * Root route: Provides interactive tester, Twitch OAuth status, and Nightbot setup instructions
  */
 app.get('/', (req, res) => {
   res.type('html').send(`<!DOCTYPE html>
@@ -600,6 +1109,9 @@ app.get('/', (req, res) => {
       --accent: #2563EB;
       --accent-bg: #EFF6FF;
       --accent-border: #DBEAFE;
+      --twitch: #9146FF;
+      --twitch-bg: #F5F3FF;
+      --twitch-border: #DDD6FE;
       --success: #10B981;
       --success-bg: #ECFDF5;
       --success-border: #D1FAE5;
@@ -660,7 +1172,7 @@ app.get('/', (req, res) => {
     
     .status-strip {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
       gap: 12px;
     }
     .status-card {
@@ -679,7 +1191,7 @@ app.get('/', (req, res) => {
       margin-bottom: 4px;
     }
     .status-value {
-      font-size: 15px;
+      font-size: 14px;
       font-weight: 600;
       color: var(--text);
     }
@@ -751,6 +1263,20 @@ app.get('/', (req, res) => {
       background: #F9FAFB;
       border-color: #D1D5DB;
     }
+    .btn-twitch {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: #9146FF;
+      color: white;
+      text-decoration: none;
+      border-radius: 8px;
+      padding: 9px 18px;
+      font-size: 13px;
+      font-weight: 600;
+      transition: background 0.15s ease;
+    }
+    .btn-twitch:hover { background: #772CE8; }
     .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
     .chip {
       background: #F3F4F6;
@@ -808,6 +1334,8 @@ app.get('/', (req, res) => {
       padding: 12px 0;
       border-bottom: 1px solid var(--card-border-subtle);
       font-size: 13px;
+      flex-wrap: wrap;
+      gap: 8px;
     }
     .endpoint-item:last-child { border-bottom: none; }
     .method {
@@ -820,6 +1348,11 @@ app.get('/', (req, res) => {
       font-size: 11px;
       margin-left: 8px;
       font-family: monospace;
+    }
+    .method-purple {
+      background: var(--twitch-bg);
+      color: var(--twitch);
+      border: 1px solid var(--twitch-border);
     }
     .status-ok {
       font-size: 12px;
@@ -839,8 +1372,8 @@ app.get('/', (req, res) => {
   <div class="container">
     <header>
       <div>
-        <h1>واجهة التحكم بالذكاء الاصطناعي (Nightbot API)</h1>
-        <p class="subtitle">Twitch AI Control Plane • مشغل بنموذج Gemini Flash باللهجة السعودية</p>
+        <h1>واجهة التحكم بالذكاء الاصطناعي (Nightbot & Twitch API)</h1>
+        <p class="subtitle">Twitch AI Control Plane • مشغل بنموذج Gemini Flash ومجهّز بربط تويتش المستقل (جعفر)</p>
       </div>
       <div class="badge"><span class="dot"></span> السيرفر يعمل بشكل ممتاز (Operational)</div>
     </header>
@@ -851,16 +1384,43 @@ app.get('/', (req, res) => {
         <div class="status-value">جاهز للاستقبال • 200 OK</div>
       </div>
       <div class="status-card">
-        <div class="status-label">نموذج الذكاء الاصطناعي الأساسي</div>
+        <div class="status-label">نموذج Gemini الأساسي</div>
         <div class="status-value" style="font-family: monospace; font-size: 13px;">${MODEL_NAME}</div>
       </div>
       <div class="status-card">
-        <div class="status-label">نظام الحماية والتعافي (Fallback)</div>
-        <div class="status-value" style="font-size: 12px; color: var(--success-text);">محاولتان كحد أقصى • تعافي سريع (${FALLBACK_MODEL})</div>
+        <div class="status-label">حساب تويتش (جعفر)</div>
+        <div class="status-value" id="twitchCardStatus" style="font-size: 13px;">جاري الفحص...</div>
       </div>
       <div class="status-card">
-        <div class="status-label">صيغة الرد لشات تويتش</div>
-        <div class="status-value">نص عادي (Plain Text)</div>
+        <div class="status-label">نظام الحماية والتعافي</div>
+        <div class="status-value" style="font-size: 12px; color: var(--success-text);">محاولتان كحد أقصى • تعافي سريع</div>
+      </div>
+    </div>
+
+    <!-- Twitch OAuth Card -->
+    <div class="card" style="border: 1px solid var(--twitch-border);">
+      <h2>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="#9146FF"><path d="M11.571 4.714h1.715v5.143H11.57zm4.715 0H18v5.143h-1.714zM6 0L1.714 4.286v15.428h5.143V24l4.286-4.286h3.428L22.286 12V0zm14.571 11.143l-3.428 3.428h-3.429l-3 3v-3H6.857V1.714h13.714z"/></svg>
+        ربط حساب تويتش المستقل (حساب جعفر • Twitch OAuth)
+      </h2>
+      <p class="card-caption">
+        يتيح ربط حساب تويتش مستقل للبوت "جعفر" بصلاحيات قراءة وكتابة الشات الحديثة (<code style="background: #F3F4F6; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 11px;">user:read:chat user:write:chat user:bot</code>) تمهيداً للتفاعل المباشر في الشات:
+      </p>
+
+      <div id="twitchAuthDisplay" style="background: #F9FAFB; border: 1px solid var(--card-border); border-radius: 8px; padding: 16px 20px; margin-bottom: 16px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+          <div>
+            <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 2px;">حالة التفويض الحالية:</div>
+            <div id="twitchStatusText" style="font-weight: 600; font-size: 14px;">جاري التحقق من السيرفر...</div>
+          </div>
+          <div style="display: flex; gap: 10px; align-items: center;">
+            <a href="/auth/twitch" id="authBtn" class="btn-twitch">ربط حساب تويتش عبر OAuth</a>
+            <a href="/auth/twitch/status" target="_blank" class="btn-secondary" style="font-size: 12px; text-decoration: none;">عرض JSON الحالة</a>
+          </div>
+        </div>
+      </div>
+      <div style="font-size: 12px; color: var(--text-muted); line-height: 1.6;">
+        🔒 <strong>أمان عالي:</strong> يتم استخدام تشفير عشوائي آمن (OAuth State مع TTL) لمنع هجمات CSRF، ولا يتم تسريب أو إظهار الـ Access Token أو الـ Refresh Token في الواجهة نهائياً.
       </div>
     </div>
 
@@ -940,12 +1500,63 @@ app.get('/', (req, res) => {
           <span class="status-ok">200 OK</span>
         </div>
       </div>
+      <div class="endpoint-item">
+        <div style="display: flex; align-items: center;">
+          <span class="method method-purple">GET</span>
+          <code style="color: #374151; font-weight: 500; margin-right: 8px;">/auth/twitch</code>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span style="color: var(--text-muted); font-size: 13px;">بدء تفويض حساب تويتش بحماية State</span>
+          <span style="font-family: monospace; font-size: 12px; color: var(--twitch);">302 Redirect</span>
+        </div>
+      </div>
+      <div class="endpoint-item">
+        <div style="display: flex; align-items: center;">
+          <span class="method method-purple">GET</span>
+          <code style="color: #374151; font-weight: 500; margin-right: 8px;">/auth/twitch/callback</code>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span style="color: var(--text-muted); font-size: 13px;">معالجة كود التفويض وتخزين التوكنات بأمان</span>
+          <span class="status-ok">200 HTML</span>
+        </div>
+      </div>
+      <div class="endpoint-item">
+        <div style="display: flex; align-items: center;">
+          <span class="method method-purple">GET</span>
+          <code style="color: #374151; font-weight: 500; margin-right: 8px;">/auth/twitch/status</code>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span style="color: var(--text-muted); font-size: 13px;">فحص حالة تفويض الحساب وهوية البوت</span>
+          <span class="status-ok">200 JSON</span>
+        </div>
+      </div>
     </div>
   </div>
 
   <script>
     const origin = window.location.origin;
     document.querySelectorAll('.appDomainSpan').forEach(el => el.innerText = origin);
+
+    // Check Twitch status dynamically
+    fetch('/auth/twitch/status')
+      .then(res => res.json())
+      .then(data => {
+        const statusText = document.getElementById('twitchStatusText');
+        const cardStatus = document.getElementById('twitchCardStatus');
+        const authBtn = document.getElementById('authBtn');
+        if (data.authorized && data.account) {
+          statusText.innerHTML = '<span style="color: #065F46;">✓ مفوض ومتصل: ' + data.account.displayName + ' (@' + data.account.login + ')</span>';
+          cardStatus.innerHTML = '<span style="color: #065F46;">متصل (' + data.account.login + ')</span>';
+          authBtn.innerText = 'إعادة الربط أو التبديل';
+        } else {
+          statusText.innerHTML = '<span style="color: #B45309;">⚠️ غير متصل حتى الآن</span>';
+          cardStatus.innerHTML = '<span style="color: #B45309;">غير متصل</span>';
+        }
+      })
+      .catch(() => {
+        document.getElementById('twitchStatusText').innerText = 'غير متصل';
+        document.getElementById('twitchCardStatus').innerText = 'غير متصل';
+      });
 
     function setQuery(text) {
       document.getElementById('queryInput').value = text;
