@@ -16,6 +16,9 @@ const TWITCH_CLIENT_SECRET = (process.env.TWITCH_CLIENT_SECRET || '').trim();
 const TWITCH_REDIRECT_URI = (process.env.TWITCH_REDIRECT_URI || '').trim() || 'https://twitch-bot-jeffe.onrender.com/auth/twitch/callback';
 const TWITCH_SCOPES = ['user:read:chat', 'user:write:chat', 'user:bot'];
 
+// Target Broadcaster Twitch Channel Name (configured via environment variable)
+const TWITCH_BROADCASTER_LOGIN = (process.env.TWITCH_BROADCASTER_LOGIN || '').trim();
+
 // In-Memory OAuth state store to guard against CSRF attacks with TTL (10 minutes)
 const oauthStateStore = new Map();
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
@@ -93,6 +96,759 @@ async function refreshTwitchTokenIfNeeded() {
     return null;
   }
 }
+
+/**
+ * ============================================================================
+ * Twitch Chat EventSub WebSocket & Send Chat Message System
+ * Official Twitch EventSub WebSocket (wss://eventsub.wss.twitch.tv/ws)
+ * Channel: Specified dynamically via TWITCH_BROADCASTER_LOGIN
+ * Bot Account: Authorized via twitchAuthState (جعفر)
+ * ============================================================================
+ */
+
+let twitchChatState = {
+  status: 'disconnected', // 'disconnected' | 'connecting' | 'connected' | 'reconnecting'
+  connected: false,
+  broadcaster: null, // { id, login, displayName }
+  sessionId: null,
+  subscriptions: {
+    chatMessage: { status: 'none', id: null },
+    streamOnline: { status: 'none', id: null },
+    streamOffline: { status: 'none', id: null },
+  },
+  connectedAt: null,
+  reconnectCount: 0,
+  lastError: null,
+  stats: {
+    messagesReceived: 0,
+    lastMessage: null, // { username, text, timestamp, isMention, isReplyToBot }
+  },
+};
+
+/**
+ * ============================================================================
+ * Twitch Stream Session Memory System
+ * Manages active stream chat memory without mixing history between streams.
+ * stream.online  -> Starts clean new session & archives previous
+ * stream.offline -> Marks session ended & archives
+ * ============================================================================
+ */
+const MAX_SESSION_MESSAGES = 400;
+const MAX_PAST_SESSIONS = 5;
+
+let currentStreamSession = {
+  id: null,
+  active: false,
+  startedAt: null,
+  endedAt: null,
+  type: 'none', // 'live' | 'pre_stream'
+  messages: [], // Array of { id, userId, userLogin, userName, text, timestamp, isMention, isReplyToBot, replyParent }
+  streamInfo: null,
+  stats: {
+    totalMessages: 0,
+    mentionsCount: 0,
+    repliesToBotCount: 0,
+  },
+};
+
+const pastStreamSessions = [];
+
+function archiveCurrentStreamSession() {
+  if (!currentStreamSession.id || currentStreamSession.messages.length === 0) return;
+  pastStreamSessions.unshift({
+    id: currentStreamSession.id,
+    startedAt: currentStreamSession.startedAt,
+    endedAt: currentStreamSession.endedAt || new Date().toISOString(),
+    type: currentStreamSession.type,
+    messageCount: currentStreamSession.messages.length,
+    stats: { ...currentStreamSession.stats },
+    sampleMessages: currentStreamSession.messages.slice(-10),
+  });
+
+  if (pastStreamSessions.length > MAX_PAST_SESSIONS) {
+    pastStreamSessions.pop();
+  }
+}
+
+function startNewStreamSession(streamEvent = null) {
+  // Archive previous session so memory NEVER mixes between streams
+  if (currentStreamSession.messages.length > 0) {
+    archiveCurrentStreamSession();
+  }
+
+  const now = new Date().toISOString();
+  currentStreamSession = {
+    id: 'stream_' + (streamEvent?.id || Date.now()),
+    active: true,
+    startedAt: streamEvent?.started_at || now,
+    endedAt: null,
+    type: 'live',
+    messages: [],
+    streamInfo: streamEvent || null,
+    stats: {
+      totalMessages: 0,
+      mentionsCount: 0,
+      repliesToBotCount: 0,
+    },
+  };
+
+  console.log(`[Twitch Stream] Started fresh stream session: ${currentStreamSession.id} at ${currentStreamSession.startedAt}`);
+}
+
+function endCurrentStreamSession() {
+  if (!currentStreamSession.id) return;
+  currentStreamSession.active = false;
+  currentStreamSession.endedAt = new Date().toISOString();
+  console.log(`[Twitch Stream] Stream ended. Session ${currentStreamSession.id} closed with ${currentStreamSession.messages.length} messages.`);
+  archiveCurrentStreamSession();
+}
+
+function ensureActiveSessionExists() {
+  if (!currentStreamSession.id) {
+    currentStreamSession.id = 'chat_session_' + Date.now();
+    currentStreamSession.startedAt = new Date().toISOString();
+    currentStreamSession.active = false;
+    currentStreamSession.type = 'pre_stream';
+  }
+}
+
+/**
+ * Analyzes incoming Twitch Chat message for Mentions and Replies to Jaafar
+ */
+function analyzeChatMessage(chatEvent, botUser) {
+  const botId = botUser?.id;
+  const botLogin = (botUser?.login || 'jaafar_bot').toLowerCase();
+  const text = (chatEvent.message?.text || '').trim();
+  const textLower = text.toLowerCase();
+
+  // 1. Detect Reply to Bot
+  const reply = chatEvent.reply || null;
+  let isReplyToBot = false;
+  if (reply) {
+    const parentUserId = reply.parent_user_id;
+    const parentUserLogin = (reply.parent_user_login || '').toLowerCase();
+    if ((botId && parentUserId === botId) || (botLogin && parentUserLogin === botLogin)) {
+      isReplyToBot = true;
+    }
+  }
+
+  // 2. Detect Mention
+  let isMention = false;
+  if (Array.isArray(chatEvent.message?.fragments)) {
+    for (const frag of chatEvent.message.fragments) {
+      if (frag.type === 'mention' && frag.mention) {
+        if ((botId && frag.mention.user_id === botId) ||
+            (botLogin && (frag.mention.user_login || '').toLowerCase() === botLogin)) {
+          isMention = true;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!isMention) {
+    if (botLogin && textLower.includes('@' + botLogin)) {
+      isMention = true;
+    } else if (text.includes('جعفر') || text.includes('يا جعفر') || text.includes('@جعفر')) {
+      isMention = true;
+    }
+  }
+
+  return {
+    isMention,
+    isReplyToBot,
+    replyParent: reply ? {
+      messageId: reply.parent_message_id,
+      userId: reply.parent_user_id,
+      userLogin: reply.parent_user_login,
+      userName: reply.parent_user_name,
+      messageBody: reply.parent_message_body,
+    } : null,
+  };
+}
+
+/**
+ * Records message into current stream session memory
+ */
+function recordStreamChatMessage(chatEvent, analysis) {
+  ensureActiveSessionExists();
+
+  const record = {
+    id: chatEvent.message_id || ('msg_' + Date.now()),
+    userId: chatEvent.chatter_user_id,
+    userLogin: chatEvent.chatter_user_login,
+    userName: chatEvent.chatter_user_name,
+    text: chatEvent.message?.text || '',
+    timestamp: new Date().toISOString(),
+    isMention: analysis.isMention,
+    isReplyToBot: analysis.isReplyToBot,
+    replyParent: analysis.replyParent,
+  };
+
+  currentStreamSession.messages.push(record);
+  currentStreamSession.stats.totalMessages++;
+  if (analysis.isMention) currentStreamSession.stats.mentionsCount++;
+  if (analysis.isReplyToBot) currentStreamSession.stats.repliesToBotCount++;
+
+  if (currentStreamSession.messages.length > MAX_SESSION_MESSAGES) {
+    currentStreamSession.messages.shift();
+  }
+
+  return record;
+}
+
+/**
+ * Retrieves recent stream chat context for Gemini prompt augmentation
+ */
+function getStreamContextRetrieval(maxRecent = 10) {
+  const msgs = currentStreamSession.messages || [];
+  if (msgs.length === 0) return '';
+  const slice = msgs.slice(-maxRecent);
+  return slice
+    .map(m => `- ${m.userName || m.userLogin}: ${m.text}`)
+    .join('\n');
+}
+
+/**
+ * Phase 2 Readiness Pipeline:
+ * Prepared to generate replies using mentions, replies, stream memory, user memory, and Gemini.
+ * AUTO-REPLY IS DISABLED AS ORDERED FOR THIS STAGE.
+ */
+const AUTO_REPLY_TO_TWITCH_CHAT = false;
+
+async function prepareJaafarChatReplyPipeline({ chatEvent, analysis, record }) {
+  if (!analysis.isMention && !analysis.isReplyToBot) {
+    return;
+  }
+
+  const chatter = chatEvent.chatter_user_name || chatEvent.chatter_user_login;
+  console.log(`[Jaafar Pipeline] Mention or Reply received from @${chatter} (isMention=${analysis.isMention}, isReplyToBot=${analysis.isReplyToBot})`);
+
+  const recentStreamChat = getStreamContextRetrieval(8);
+  const userHistory = getUserHistory(chatEvent.chatter_user_login);
+
+  let promptText = '';
+  if (currentStreamSession.active) {
+    promptText += `[سياق البث الحي الحالي - ${currentStreamSession.id}]:\n`;
+  } else {
+    promptText += `[سياق شات القناة]:\n`;
+  }
+
+  if (recentStreamChat) {
+    promptText += `سياق آخر رسائل تم تداولها بالشات مؤخراً:\n${recentStreamChat}\n\n`;
+  }
+
+  if (userHistory.length > 0) {
+    promptText += `تاريخ حديثك السابق مع المشاهد (@${chatter}):\n`;
+    userHistory.forEach(turn => {
+      promptText += (turn.role === 'user' ? `@${chatter}: ` : 'جعفر: ') + turn.text + '\n';
+    });
+    promptText += '\n';
+  }
+
+  if (analysis.isReplyToBot && analysis.replyParent?.messageBody) {
+    promptText += `المشاهد @${chatter} يرد على رسالتك السابقة:\n"${analysis.replyParent.messageBody}"\n`;
+    promptText += `ورسالة المشاهد الحالية هي:\n"${record.text}"\n`;
+  } else {
+    promptText += `المشاهد @${chatter} منشنك أو وجه كلامه لك مباشرة:\n"${record.text}"\n`;
+  }
+
+  promptText += 'رد عليه بأسلوب جعفر العفوي والمحبوب، وبشكل مختصر جداً مناسب للشات.';
+
+  const isGeminiReady = Boolean(getAiClient());
+  console.log(`[Jaafar Pipeline] Retrieval & Prompt Ready (${promptText.length} chars). Gemini Ready: ${isGeminiReady}. Auto-reply is OFF. Armed and ready for Phase 2.`);
+
+  if (!AUTO_REPLY_TO_TWITCH_CHAT) {
+    return;
+  }
+
+  // Next Phase execution:
+  try {
+    const aiResult = await executeGeminiWithRecovery({ prompt: promptText });
+    recordUserTurn(chatEvent.chatter_user_login, record.text, aiResult.text);
+    await sendTwitchChatMessage(`@${chatter} ${aiResult.text}`);
+  } catch (err) {
+    console.error('[Jaafar Pipeline] Error sending reply:', err);
+  }
+}
+
+
+let eventSubWs = null;
+let keepaliveWatchdogTimer = null;
+let reconnectTimer = null;
+let isReconnectingSession = false;
+
+/**
+ * Resolves user profile from Twitch Helix API by username/login
+ */
+async function fetchTwitchUserInfoByLogin(login) {
+  if (!login) return null;
+  const token = await refreshTwitchTokenIfNeeded();
+  if (!token || !TWITCH_CLIENT_ID) {
+    console.warn(`[Twitch API] Cannot fetch user "${login}": Missing OAuth token or Client ID`);
+    return null;
+  }
+
+  try {
+    const res = await fetch(`https://api.twitch.tv/helix/users?login=${encodeURIComponent(login.toLowerCase())}`, {
+      method: 'GET',
+      headers: {
+        'Client-Id': TWITCH_CLIENT_ID,
+        'Authorization': `Bearer ${token}`,
+      },
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error(`[Twitch API] Failed to fetch user info for "${login}": HTTP ${res.status} - ${errText}`);
+      return null;
+    }
+
+    const json = await res.json();
+    if (json.data && json.data.length > 0) {
+      return {
+        id: json.data[0].id,
+        login: json.data[0].login,
+        displayName: json.data[0].display_name,
+        profileImageUrl: json.data[0].profile_image_url || '',
+      };
+    }
+    console.warn(`[Twitch API] User "${login}" was not found on Twitch.`);
+    return null;
+  } catch (err) {
+    console.error(`[Twitch API] Error fetching user "${login}":`, err?.message || err);
+    return null;
+  }
+}
+
+/**
+ * Helper to subscribe to a single Twitch EventSub topic via WebSocket transport
+ */
+async function subscribeToSingleEventSub({ sessionId, type, version = '1', condition, token }) {
+  try {
+    const res = await fetch('https://api.twitch.tv/helix/eventsub/subscriptions', {
+      method: 'POST',
+      headers: {
+        'Client-Id': TWITCH_CLIENT_ID,
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        type,
+        version,
+        condition,
+        transport: {
+          method: 'websocket',
+          session_id: sessionId,
+        },
+      }),
+    });
+
+    if (res.status === 202 || res.status === 200) {
+      const json = await res.json();
+      const sub = json.data && json.data[0];
+      console.log(`[Twitch EventSub] ✓ Subscribed to ${type} (ID: ${sub?.id || 'ok'})`);
+      return { status: 'enabled', id: sub?.id || null };
+    }
+
+    if (res.status === 409) {
+      console.log(`[Twitch EventSub] Subscription ${type} already active (409 Conflict).`);
+      return { status: 'enabled', id: null };
+    }
+
+    const errText = await res.text();
+    console.error(`[Twitch EventSub] Subscription ${type} failed with HTTP ${res.status}: ${errText}`);
+    return { status: 'failed', id: null, error: errText };
+  } catch (err) {
+    console.error(`[Twitch EventSub] Error subscribing to ${type}:`, err?.message || err);
+    return { status: 'failed', id: null, error: err?.message || err };
+  }
+}
+
+/**
+ * Subscribes to all required Twitch EventSub topics:
+ * 1. channel.chat.message (receives chat in Jef's channel)
+ * 2. stream.online (starts fresh stream session memory)
+ * 3. stream.offline (ends stream session memory & archives)
+ */
+async function subscribeToAllTwitchEvents(sessionId) {
+  if (!sessionId) {
+    console.error('[Twitch EventSub] Cannot subscribe: Missing EventSub WebSocket session ID');
+    return false;
+  }
+
+  const token = await refreshTwitchTokenIfNeeded();
+  if (!token || !TWITCH_CLIENT_ID) {
+    console.error('[Twitch EventSub] Cannot subscribe: Missing OAuth token or Client ID');
+    return false;
+  }
+
+  const botUserId = twitchAuthState.user?.id;
+  if (!botUserId) {
+    console.error('[Twitch EventSub] Cannot subscribe: Missing Bot User ID');
+    return false;
+  }
+
+  // Ensure broadcaster user ID is resolved dynamically
+  if (!twitchChatState.broadcaster?.id) {
+    if (!TWITCH_BROADCASTER_LOGIN) {
+      console.warn('[Twitch EventSub] TWITCH_BROADCASTER_LOGIN is not set in environment variables. Cannot subscribe.');
+      twitchChatState.lastError = 'TWITCH_BROADCASTER_LOGIN is not configured in environment variables.';
+      return false;
+    }
+    console.log(`[Twitch EventSub] Resolving broadcaster user ID for login: "${TWITCH_BROADCASTER_LOGIN}"...`);
+    const broadcasterInfo = await fetchTwitchUserInfoByLogin(TWITCH_BROADCASTER_LOGIN);
+    if (!broadcasterInfo) {
+      console.error(`[Twitch EventSub] Failed to resolve broadcaster "${TWITCH_BROADCASTER_LOGIN}". Subscription aborted.`);
+      twitchChatState.lastError = `Broadcaster "${TWITCH_BROADCASTER_LOGIN}" not found on Twitch.`;
+      return false;
+    }
+    twitchChatState.broadcaster = broadcasterInfo;
+    console.log(`[Twitch EventSub] Broadcaster resolved: ${broadcasterInfo.displayName} (@${broadcasterInfo.login}, ID: ${broadcasterInfo.id})`);
+  }
+
+  const broadcasterId = twitchChatState.broadcaster.id;
+
+  // 1. channel.chat.message
+  const chatSub = await subscribeToSingleEventSub({
+    sessionId,
+    type: 'channel.chat.message',
+    version: '1',
+    condition: {
+      broadcaster_user_id: broadcasterId,
+      user_id: botUserId,
+    },
+    token,
+  });
+  twitchChatState.subscriptions.chatMessage = chatSub;
+
+  // 2. stream.online
+  const onlineSub = await subscribeToSingleEventSub({
+    sessionId,
+    type: 'stream.online',
+    version: '1',
+    condition: {
+      broadcaster_user_id: broadcasterId,
+    },
+    token,
+  });
+  twitchChatState.subscriptions.streamOnline = onlineSub;
+
+  // 3. stream.offline
+  const offlineSub = await subscribeToSingleEventSub({
+    sessionId,
+    type: 'stream.offline',
+    version: '1',
+    condition: {
+      broadcaster_user_id: broadcasterId,
+    },
+    token,
+  });
+  twitchChatState.subscriptions.streamOffline = offlineSub;
+
+  const hasAnyFailure = [chatSub, onlineSub, offlineSub].some(s => s.status === 'failed');
+  if (hasAnyFailure) {
+    twitchChatState.lastError = 'One or more EventSub subscriptions failed.';
+  } else {
+    twitchChatState.lastError = null;
+  }
+
+  return true;
+}
+
+// Retain alias for backward-compatibility
+const subscribeToChannelChatMessage = subscribeToAllTwitchEvents;
+
+/**
+ * Resets the keepalive watchdog timer.
+ * If Twitch doesn't send a message or keepalive within timeout + grace buffer, reconnect.
+ */
+function resetKeepaliveWatchdog(timeoutSeconds = 10) {
+  if (keepaliveWatchdogTimer) {
+    clearTimeout(keepaliveWatchdogTimer);
+  }
+  const graceMs = (timeoutSeconds + 5) * 1000;
+  keepaliveWatchdogTimer = setTimeout(() => {
+    console.warn('[Twitch Chat] Keepalive watchdog timeout exceeded. Reconnecting WebSocket...');
+    if (eventSubWs) {
+      try {
+        eventSubWs.close(4000, 'Keepalive watchdog timeout');
+      } catch (_) {}
+    }
+  }, graceMs);
+}
+
+/**
+ * Schedules a reconnection attempt with backoff
+ */
+function scheduleChatReconnect(delayMs = 5000) {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+  }
+  twitchChatState.status = 'reconnecting';
+  twitchChatState.connected = false;
+  console.log(`[Twitch Chat] Reconnecting in ${delayMs / 1000}s...`);
+  reconnectTimer = setTimeout(() => {
+    startTwitchChatConnection();
+  }, delayMs);
+}
+
+/**
+ * Starts or restarts the Twitch EventSub WebSocket connection
+ */
+async function startTwitchChatConnection(customWsUrl = null) {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
+  // 1. Guard: Check if OAuth is authorized
+  if (!twitchAuthState.authorized) {
+    console.log('[Twitch Chat] Bot account is not authorized yet. Visit /auth/twitch to authenticate.');
+    twitchChatState.status = 'disconnected';
+    twitchChatState.connected = false;
+    return;
+  }
+
+  // 2. Ensure token is fresh before connecting
+  const token = await refreshTwitchTokenIfNeeded();
+  if (!token) {
+    console.warn('[Twitch Chat] OAuth token refresh failed. Chat connection paused.');
+    twitchChatState.status = 'disconnected';
+    twitchChatState.connected = false;
+    return;
+  }
+
+  // 3. Close any existing WebSocket if starting fresh (not reconnecting URL)
+  if (!customWsUrl && eventSubWs) {
+    try {
+      eventSubWs.onclose = null;
+      eventSubWs.onerror = null;
+      eventSubWs.close();
+    } catch (_) {}
+    eventSubWs = null;
+  }
+
+  const targetUrl = customWsUrl || 'wss://eventsub.wss.twitch.tv/ws';
+  twitchChatState.status = customWsUrl ? 'reconnecting' : 'connecting';
+  console.log(`[Twitch Chat] Connecting to EventSub WebSocket at ${targetUrl}...`);
+
+  try {
+    const ws = new WebSocket(targetUrl);
+    eventSubWs = ws;
+
+    ws.onopen = () => {
+      console.log('[Twitch Chat] WebSocket connection opened. Awaiting session_welcome...');
+    };
+
+    ws.onmessage = async (event) => {
+      let data;
+      try {
+        data = JSON.parse(event.data);
+      } catch (e) {
+        console.warn('[Twitch Chat] Failed to parse EventSub message JSON:', e);
+        return;
+      }
+
+      const msgType = data.metadata?.message_type;
+
+      // 1. Welcome Message
+      if (msgType === 'session_welcome') {
+        const session = data.payload?.session;
+        const sessionId = session?.id;
+        const keepaliveSeconds = session?.keepalive_timeout_seconds || 10;
+
+        twitchChatState.sessionId = sessionId;
+        twitchChatState.status = 'connected';
+        twitchChatState.connected = true;
+        twitchChatState.connectedAt = new Date().toISOString();
+        twitchChatState.lastError = null;
+        console.log(`[Twitch Chat] EventSub session established (ID: ${sessionId}). Keepalive: ${keepaliveSeconds}s`);
+
+        resetKeepaliveWatchdog(keepaliveSeconds);
+
+        // If this was a session_reconnect migration, subscriptions are preserved
+        if (isReconnectingSession) {
+          isReconnectingSession = false;
+          console.log('[Twitch Chat] Reconnected session active. Subscriptions maintained.');
+        } else {
+          // Subscribe to channel.chat.message
+          await subscribeToChannelChatMessage(sessionId);
+        }
+        return;
+      }
+
+      // 2. Keepalive Message
+      if (msgType === 'session_keepalive') {
+        resetKeepaliveWatchdog(10);
+        return;
+      }
+
+      // 3. Reconnect Message
+      if (msgType === 'session_reconnect') {
+        const reconnectUrl = data.payload?.session?.reconnect_url;
+        console.log(`[Twitch Chat] Twitch requested session_reconnect to: ${reconnectUrl}`);
+        if (reconnectUrl) {
+          isReconnectingSession = true;
+          startTwitchChatConnection(reconnectUrl);
+        }
+        return;
+      }
+
+      // 4. Notification (Chat Messages, Stream Online, Stream Offline)
+      if (msgType === 'notification') {
+        resetKeepaliveWatchdog(10);
+        const subType = data.payload?.subscription?.type;
+
+        // A. Chat message event
+        if (subType === 'channel.chat.message') {
+          const chatEvent = data.payload.event;
+          const chatterName = chatEvent.chatter_user_name || chatEvent.chatter_user_login || 'unknown';
+          const messageText = chatEvent.message?.text || '';
+
+          // 1. Analyze for mentions and replies to bot
+          const analysis = analyzeChatMessage(chatEvent, twitchAuthState.user);
+
+          // 2. Terminal logging with visual indicator for mentions/replies
+          const badge = analysis.isReplyToBot ? ' [ReplyToBot]' : (analysis.isMention ? ' [Mention]' : '');
+          console.log(`[Twitch Chat]${badge} ${chatterName}: ${messageText}`);
+
+          // 3. Record into isolated current stream session memory
+          const record = recordStreamChatMessage(chatEvent, analysis);
+
+          twitchChatState.stats.messagesReceived++;
+          twitchChatState.stats.lastMessage = {
+            username: chatterName,
+            text: messageText,
+            timestamp: record.timestamp,
+            isMention: analysis.isMention,
+            isReplyToBot: analysis.isReplyToBot,
+          };
+
+          // 4. Phase 2 readiness pipeline: Retrieves stream memory, user memory, builds Gemini prompt.
+          // Note: Automatic replies are strictly disabled in this stage as requested.
+          prepareJaafarChatReplyPipeline({
+            chatEvent,
+            analysis,
+            record,
+          });
+          return;
+        }
+
+        // B. Stream Online event (starts fresh isolated stream session)
+        if (subType === 'stream.online') {
+          const streamEvent = data.payload.event;
+          console.log(`[Twitch Stream] >>> Stream went ONLINE for channel #${twitchChatState.broadcaster?.login || 'broadcaster'}!`);
+          startNewStreamSession(streamEvent);
+          return;
+        }
+
+        // C. Stream Offline event (ends current stream session & archives)
+        if (subType === 'stream.offline') {
+          console.log(`[Twitch Stream] <<< Stream went OFFLINE for channel #${twitchChatState.broadcaster?.login || 'broadcaster'}.`);
+          endCurrentStreamSession();
+          return;
+        }
+        return;
+      }
+
+      // 5. Revocation Message
+      if (msgType === 'revocation') {
+        const revokedType = data.payload?.subscription?.type;
+        console.warn(`[Twitch Chat] Subscription revoked: ${revokedType}. Reason: ${data.payload?.subscription?.status}`);
+        if (revokedType === 'channel.chat.message') {
+          twitchChatState.subscriptions.chatMessage.status = 'failed';
+        } else if (revokedType === 'stream.online') {
+          twitchChatState.subscriptions.streamOnline.status = 'failed';
+        } else if (revokedType === 'stream.offline') {
+          twitchChatState.subscriptions.streamOffline.status = 'failed';
+        }
+        twitchChatState.lastError = `Subscription ${revokedType} revoked: ${data.payload?.subscription?.status}`;
+      }
+    };
+
+    ws.onerror = (err) => {
+      console.error('[Twitch Chat] WebSocket error encountered:', err?.message || err);
+      twitchChatState.lastError = err?.message || 'WebSocket network error';
+    };
+
+    ws.onclose = (event) => {
+      if (keepaliveWatchdogTimer) {
+        clearTimeout(keepaliveWatchdogTimer);
+        keepaliveWatchdogTimer = null;
+      }
+      twitchChatState.connected = false;
+      twitchChatState.status = 'disconnected';
+      console.warn(`[Twitch Chat] WebSocket closed (Code: ${event.code}, Reason: "${event.reason || 'None'}").`);
+
+      // If still authorized and not reconnecting via explicit URL, schedule auto-reconnect
+      if (twitchAuthState.authorized && !isReconnectingSession) {
+        twitchChatState.reconnectCount++;
+        scheduleChatReconnect(5000);
+      }
+    };
+  } catch (err) {
+    console.error('[Twitch Chat] Failed to initiate WebSocket connection:', err?.message || err);
+    twitchChatState.lastError = err?.message || 'Failed to initiate WebSocket';
+    if (twitchAuthState.authorized) {
+      scheduleChatReconnect(10000);
+    }
+  }
+}
+
+/**
+ * Sends a chat message to the broadcaster's channel using Twitch Helix Send Chat Message API
+ * POST https://api.twitch.tv/helix/chat/messages
+ * Scopes: user:write:chat
+ */
+async function sendTwitchChatMessage(messageText) {
+  if (!messageText || typeof messageText !== 'string' || !messageText.trim()) {
+    return { success: false, error: 'Empty message text' };
+  }
+
+  const token = await refreshTwitchTokenIfNeeded();
+  if (!token) {
+    return { success: false, error: 'Twitch account not authorized or token expired' };
+  }
+
+  if (!twitchChatState.broadcaster?.id) {
+    return { success: false, error: 'Broadcaster user ID not resolved' };
+  }
+
+  const botUserId = twitchAuthState.user?.id;
+  if (!botUserId) {
+    return { success: false, error: 'Bot user ID not resolved' };
+  }
+
+  try {
+    const res = await fetch('https://api.twitch.tv/helix/chat/messages', {
+      method: 'POST',
+      headers: {
+        'Client-Id': TWITCH_CLIENT_ID,
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        broadcaster_id: twitchChatState.broadcaster.id,
+        sender_id: botUserId,
+        message: messageText.trim().slice(0, 500),
+      }),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.text();
+      console.error(`[Twitch API] Failed to send chat message: HTTP ${res.status} - ${errBody}`);
+      return { success: false, status: res.status, error: errBody };
+    }
+
+    const data = await res.json();
+    return { success: true, data };
+  } catch (err) {
+    console.error('[Twitch API] Error sending chat message:', err?.message || err);
+    return { success: false, error: err?.message || err };
+  }
+}
+
 
 // Default Gemini Flash model (easily configurable via GEMINI_MODEL env var)
 // gemini-3.1-flash-lite is fast, free-tier friendly, and verified available
@@ -880,6 +1636,9 @@ app.get('/auth/twitch/callback', async (req, res) => {
 
     console.log(`[Twitch OAuth] Successfully authorized Twitch account: @${accountLogin} (${accountDisplayName})`);
 
+    // Initiate Twitch Chat EventSub WebSocket connection now that OAuth is authorized
+    startTwitchChatConnection();
+
     // 7. Render simple, polished success view
     return res.type('html').send(`<!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -1084,6 +1843,82 @@ app.get('/auth/twitch/status', (req, res) => {
     redirectUri: TWITCH_REDIRECT_URI,
   });
 });
+
+/**
+ * GET /api/twitch/chat/status
+ * Returns current Twitch Chat EventSub WebSocket connection status,
+ * broadcaster target channel, stream session memory state, and readiness details.
+ */
+app.get('/api/twitch/chat/status', (req, res) => {
+  return res.status(200).json({
+    connected: twitchChatState.connected,
+    status: twitchChatState.status,
+    broadcasterLogin: TWITCH_BROADCASTER_LOGIN || null,
+    broadcaster: twitchChatState.broadcaster ? {
+      id: twitchChatState.broadcaster.id,
+      login: twitchChatState.broadcaster.login,
+      displayName: twitchChatState.broadcaster.displayName,
+    } : null,
+    botUser: twitchAuthState.user ? {
+      id: twitchAuthState.user.id,
+      login: twitchAuthState.user.login,
+      displayName: twitchAuthState.user.displayName,
+    } : null,
+    subscriptions: {
+      chatMessage: twitchChatState.subscriptions.chatMessage,
+      streamOnline: twitchChatState.subscriptions.streamOnline,
+      streamOffline: twitchChatState.subscriptions.streamOffline,
+    },
+    streamSession: {
+      active: currentStreamSession.active,
+      id: currentStreamSession.id,
+      type: currentStreamSession.type,
+      startedAt: currentStreamSession.startedAt,
+      endedAt: currentStreamSession.endedAt,
+      messageCount: currentStreamSession.messages.length,
+      stats: {
+        totalMessages: currentStreamSession.stats.totalMessages,
+        mentionsCount: currentStreamSession.stats.mentionsCount,
+        repliesToBotCount: currentStreamSession.stats.repliesToBotCount,
+      },
+      recentMessages: currentStreamSession.messages.slice(-8).map(m => ({
+        id: m.id,
+        username: m.userName || m.userLogin,
+        text: m.text,
+        timestamp: m.timestamp,
+        isMention: m.isMention,
+        isReplyToBot: m.isReplyToBot,
+        replyParent: m.replyParent ? {
+          parentUser: m.replyParent.userName || m.replyParent.userLogin,
+          parentBody: m.replyParent.messageBody,
+        } : null,
+      })),
+    },
+    pastSessionsCount: pastStreamSessions.length,
+    readiness: {
+      canDetectMentions: true,
+      canDetectReplies: true,
+      hasStreamSessionMemory: true,
+      hasUserMemory: true,
+      geminiReady: Boolean(getAiClient()),
+      autoReplyEnabled: AUTO_REPLY_TO_TWITCH_CHAT,
+    },
+    stats: {
+      messagesReceived: twitchChatState.stats.messagesReceived,
+      lastMessage: twitchChatState.stats.lastMessage,
+      connectedAt: twitchChatState.connectedAt,
+      reconnectCount: twitchChatState.reconnectCount,
+    },
+    lastError: twitchChatState.lastError,
+    authStatus: {
+      authorized: twitchAuthState.authorized,
+      hasClientId: Boolean(TWITCH_CLIENT_ID),
+      hasClientSecret: Boolean(TWITCH_CLIENT_SECRET),
+      hasBroadcasterLogin: Boolean(TWITCH_BROADCASTER_LOGIN),
+    },
+  });
+});
+
 
 /**
  * Root route: Provides interactive tester, Twitch OAuth status, and Nightbot setup instructions
@@ -1392,8 +2227,8 @@ app.get('/', (req, res) => {
         <div class="status-value" id="twitchCardStatus" style="font-size: 13px;">جاري الفحص...</div>
       </div>
       <div class="status-card">
-        <div class="status-label">نظام الحماية والتعافي</div>
-        <div class="status-value" style="font-size: 12px; color: var(--success-text);">محاولتان كحد أقصى • تعافي سريع</div>
+        <div class="status-label">اتصال الشات (EventSub WS)</div>
+        <div class="status-value" id="twitchChatCardStatus" style="font-size: 13px;">جاري الفحص...</div>
       </div>
     </div>
 
@@ -1530,6 +2365,16 @@ app.get('/', (req, res) => {
           <span class="status-ok">200 JSON</span>
         </div>
       </div>
+      <div class="endpoint-item">
+        <div style="display: flex; align-items: center;">
+          <span class="method method-purple">GET</span>
+          <code style="color: #374151; font-weight: 500; margin-right: 8px;">/api/twitch/chat/status</code>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span style="color: var(--text-muted); font-size: 13px;">فحص اتصال EventSub WebSocket وإحصائيات الشات</span>
+          <span class="status-ok">200 JSON</span>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1537,7 +2382,7 @@ app.get('/', (req, res) => {
     const origin = window.location.origin;
     document.querySelectorAll('.appDomainSpan').forEach(el => el.innerText = origin);
 
-    // Check Twitch status dynamically
+    // Check Twitch OAuth status
     fetch('/auth/twitch/status')
       .then(res => res.json())
       .then(data => {
@@ -1557,6 +2402,23 @@ app.get('/', (req, res) => {
         document.getElementById('twitchStatusText').innerText = 'غير متصل';
         document.getElementById('twitchCardStatus').innerText = 'غير متصل';
       });
+
+    // Check Twitch Chat EventSub status
+    fetch('/api/twitch/chat/status')
+      .then(res => res.json())
+      .then(data => {
+        const chatStatusElem = document.getElementById('twitchChatCardStatus');
+        if (chatStatusElem) {
+          if (data.connected) {
+            chatStatusElem.innerHTML = '<span style="color: #065F46;">متصل بالـ WebSocket ✓</span>';
+          } else if (data.status === 'connecting' || data.status === 'reconnecting') {
+            chatStatusElem.innerHTML = '<span style="color: #2563EB;">جاري الاتصال...</span>';
+          } else {
+            chatStatusElem.innerHTML = '<span style="color: #6B7280;">غير متصل (بانتظار التفويض)</span>';
+          }
+        }
+      })
+      .catch(() => {});
 
     function setQuery(text) {
       document.getElementById('queryInput').value = text;
@@ -1603,4 +2465,16 @@ app.get('/', (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`[Twitch AI Server] Running on http://0.0.0.0:${PORT}`);
   console.log(`[Twitch AI Server] Model: ${MODEL_NAME}`);
+
+  // Twitch Chat EventSub WebSocket initialization check
+  if (twitchAuthState.authorized) {
+    console.log('[Twitch Chat] Bot account authorized at startup. Connecting to Twitch Chat EventSub...');
+    startTwitchChatConnection();
+  } else {
+    console.log('[Twitch Chat] Bot account is not authorized yet. Visit /auth/twitch to link account.');
+    if (!TWITCH_BROADCASTER_LOGIN) {
+      console.log('[Twitch Chat] Notice: TWITCH_BROADCASTER_LOGIN environment variable is not configured.');
+    }
+  }
 });
+
