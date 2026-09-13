@@ -2,6 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import { GoogleGenAI } from '@google/genai';
 
 // Load environment variables from .env if available
@@ -14,7 +16,12 @@ const PORT = process.env.PORT || 3000;
 const TWITCH_CLIENT_ID = (process.env.TWITCH_CLIENT_ID || '').trim();
 const TWITCH_CLIENT_SECRET = (process.env.TWITCH_CLIENT_SECRET || '').trim();
 const TWITCH_REDIRECT_URI = (process.env.TWITCH_REDIRECT_URI || '').trim() || 'https://twitch-bot-jeffe.onrender.com/auth/twitch/callback';
-const TWITCH_SCOPES = ['user:read:chat', 'user:write:chat', 'user:bot'];
+const TWITCH_SCOPES = [
+  'user:read:chat',
+  'user:write:chat',
+  'user:bot',
+  'moderator:manage:banned_users',
+];
 
 // Target Broadcaster Twitch Channel Name (configured via environment variable)
 const TWITCH_BROADCASTER_LOGIN = (process.env.TWITCH_BROADCASTER_LOGIN || '').trim();
@@ -33,7 +40,6 @@ function cleanupExpiredOAuthStates() {
 }
 
 // In-Memory Twitch authentication state for bot account "جعفر"
-// Kept in server memory, ready for Phase 2 (EventSub, Chat reading/writing)
 let twitchAuthState = {
   authorized: false,
   user: null, // { id, login, displayName, profileImageUrl }
@@ -45,15 +51,111 @@ let twitchAuthState = {
 };
 
 /**
- * Safely refresh Twitch access token using refresh_token when needed
- * Ready for future phases (sending messages, EventSub, chat listening)
+ * ============================================================================
+ * Free-Tier OAuth Token Handling & Session Management
+ * Render Free Web Services use ephemeral container filesystems.
+ * - Primary guaranteed persistence: TWITCH_REFRESH_TOKEN environment variable.
+ * - Runtime session cache: ./.data/twitch_auth.json (cached while container runs).
+ * ============================================================================
  */
-async function refreshTwitchTokenIfNeeded() {
+function getTwitchStorageFilePath() {
+  if (process.env.TWITCH_STORAGE_PATH && process.env.TWITCH_STORAGE_PATH.trim()) {
+    return process.env.TWITCH_STORAGE_PATH.trim();
+  }
+  return path.join(process.cwd(), '.data', 'twitch_auth.json');
+}
+
+function hasSavedTwitchAuth() {
+  if (process.env.TWITCH_REFRESH_TOKEN && process.env.TWITCH_REFRESH_TOKEN.trim()) {
+    return true;
+  }
+  try {
+    const filePath = getTwitchStorageFilePath();
+    return fs.existsSync(filePath);
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * Persists Twitch authentication state to runtime cache safely
+ */
+function saveTwitchAuthStateToDisk() {
+  if (!twitchAuthState.authorized || !twitchAuthState.refreshToken) {
+    return false;
+  }
+  try {
+    const filePath = getTwitchStorageFilePath();
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const payload = {
+      authorized: true,
+      user: twitchAuthState.user,
+      scopes: twitchAuthState.scopes,
+      expiresAt: twitchAuthState.expiresAt,
+      accessToken: twitchAuthState.accessToken,
+      refreshToken: twitchAuthState.refreshToken,
+      connectedAt: twitchAuthState.connectedAt,
+      savedAt: new Date().toISOString(),
+    };
+    fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), { mode: 0o600, encoding: 'utf8' });
+    return true;
+  } catch (err) {
+    console.error('[Twitch Storage] Error saving runtime OAuth cache:', err?.message || err);
+    return false;
+  }
+}
+
+/**
+ * Loads Twitch authentication state from environment variable or runtime cache
+ */
+function loadTwitchAuthStateFromDisk() {
+  // 1. Check TWITCH_REFRESH_TOKEN environment variable (primary persistence on Render Free)
+  if (process.env.TWITCH_REFRESH_TOKEN && process.env.TWITCH_REFRESH_TOKEN.trim()) {
+    console.log('[Twitch Storage] Bootstrapping OAuth from TWITCH_REFRESH_TOKEN environment variable.');
+    return {
+      authorized: true,
+      user: null,
+      scopes: TWITCH_SCOPES,
+      expiresAt: 0,
+      accessToken: null,
+      refreshToken: process.env.TWITCH_REFRESH_TOKEN.trim(),
+      connectedAt: new Date().toISOString(),
+      source: 'environment',
+    };
+  }
+
+  // 2. Check local container runtime cache
+  try {
+    const filePath = getTwitchStorageFilePath();
+    if (fs.existsSync(filePath)) {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      const data = JSON.parse(raw);
+      if (data && (data.refreshToken || data.accessToken)) {
+        console.log(`[Twitch Storage] Loaded runtime cached OAuth credentials (user: @${data.user?.login || 'bot'})`);
+        data.source = 'cache';
+        return data;
+      }
+    }
+  } catch (err) {
+    console.error('[Twitch Storage] Error reading runtime cached OAuth credentials:', err?.message || err);
+  }
+
+  return null;
+}
+
+/**
+ * Safely refresh Twitch access token using refresh_token when needed
+ * Automatically persists refreshed tokens to disk.
+ */
+async function refreshTwitchTokenIfNeeded(force = false) {
   if (!twitchAuthState.authorized || !twitchAuthState.refreshToken) {
     return null;
   }
-  // Refresh 2 minutes before expiry
-  if (Date.now() < (twitchAuthState.expiresAt - 2 * 60 * 1000)) {
+  // If not forcing and access token is still fresh (at least 2 minutes remaining), return it
+  if (!force && twitchAuthState.accessToken && Date.now() < (twitchAuthState.expiresAt - 2 * 60 * 1000)) {
     return twitchAuthState.accessToken;
   }
   if (!TWITCH_CLIENT_ID || !TWITCH_CLIENT_SECRET) {
@@ -78,7 +180,8 @@ async function refreshTwitchTokenIfNeeded() {
     });
 
     if (!response.ok) {
-      console.error(`[Twitch OAuth] Token refresh failed with status: ${response.status}`);
+      const errText = await response.text();
+      console.error(`[Twitch OAuth] Token refresh failed with status ${response.status}: ${errText}`);
       return null;
     }
 
@@ -90,11 +193,85 @@ async function refreshTwitchTokenIfNeeded() {
     twitchAuthState.expiresAt = Date.now() + (data.expires_in * 1000);
     twitchAuthState.scopes = data.scope || twitchAuthState.scopes;
     console.log('[Twitch OAuth] Token refreshed successfully for user:', twitchAuthState.user?.login || 'bot');
+    
+    // Persist refreshed credentials immediately
+    saveTwitchAuthStateToDisk();
     return twitchAuthState.accessToken;
   } catch (err) {
     console.error('[Twitch OAuth] Error refreshing token:', err?.message || err);
     return null;
   }
+}
+
+/**
+ * Ensures bot account user profile is fetched and cached
+ */
+async function ensureTwitchUserProfile() {
+  if (twitchAuthState.user?.id && twitchAuthState.user?.login) {
+    return twitchAuthState.user;
+  }
+  const token = await refreshTwitchTokenIfNeeded();
+  if (!token || !TWITCH_CLIENT_ID) return null;
+  try {
+    const res = await fetch('https://api.twitch.tv/helix/users', {
+      headers: {
+        'Client-Id': TWITCH_CLIENT_ID,
+        'Authorization': `Bearer ${token}`,
+      },
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.data && data.data.length > 0) {
+        const u = data.data[0];
+        twitchAuthState.user = {
+          id: u.id,
+          login: u.login,
+          displayName: u.display_name,
+          profileImageUrl: u.profile_image_url,
+        };
+        saveTwitchAuthStateToDisk();
+        console.log(`[Twitch OAuth] Bot profile confirmed: @${u.login} (${u.display_name}, ID: ${u.id})`);
+        return twitchAuthState.user;
+      }
+    }
+  } catch (err) {
+    console.error('[Twitch OAuth] Failed to fetch user profile:', err?.message || err);
+  }
+  return null;
+}
+
+/**
+ * Restores OAuth session from environment variable or runtime cache upon server boot,
+ * refreshes tokens, and prepares Twitch EventSub connection.
+ */
+async function restoreTwitchAuthAndConnect() {
+  const saved = loadTwitchAuthStateFromDisk();
+  if (!saved || !saved.refreshToken) {
+    return false;
+  }
+
+  console.log(`[Twitch Storage] Restoring Twitch OAuth session (source: ${saved.source || 'disk'})...`);
+  twitchAuthState.authorized = true;
+  twitchAuthState.refreshToken = saved.refreshToken;
+  twitchAuthState.accessToken = saved.accessToken || null;
+  twitchAuthState.expiresAt = saved.expiresAt || 0;
+  twitchAuthState.scopes = saved.scopes || TWITCH_SCOPES;
+  twitchAuthState.user = saved.user || null;
+  twitchAuthState.connectedAt = saved.connectedAt || new Date().toISOString();
+
+  // Validate or refresh token using refresh_token
+  const token = await refreshTwitchTokenIfNeeded(true);
+  if (!token) {
+    console.warn('[Twitch Storage] Token could not be refreshed. User may need to re-authenticate via /auth/twitch.');
+    return false;
+  }
+
+  // Ensure user profile details are populated
+  await ensureTwitchUserProfile();
+
+  console.log(`[Twitch Storage] Session restored successfully for @${twitchAuthState.user?.login || 'bot'}. Connecting to EventSub WebSocket...`);
+  startTwitchChatConnection();
+  return true;
 }
 
 /**
@@ -579,18 +756,26 @@ function resetKeepaliveWatchdog(timeoutSeconds = 10) {
 }
 
 /**
- * Schedules a reconnection attempt with backoff
+ * Schedules a reconnection attempt with gradual backoff
  */
-function scheduleChatReconnect(delayMs = 5000) {
+function scheduleChatReconnect(delayMs = null) {
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
+    reconnectTimer = null;
   }
   twitchChatState.status = 'reconnecting';
   twitchChatState.connected = false;
-  console.log(`[Twitch Chat] Reconnecting in ${delayMs / 1000}s...`);
+
+  const attempt = twitchChatState.reconnectCount || 0;
+  // Gradual backoff: 3s, 4.5s, 6.7s, 10s, 15s, 22s... capped at 60s
+  const computedDelay = delayMs !== null
+    ? delayMs
+    : Math.min(60000, Math.round(3000 * Math.pow(1.5, Math.min(attempt, 8))));
+
+  console.log(`[Twitch Chat] Reconnecting in ${(computedDelay / 1000).toFixed(1)}s (Attempt #${attempt + 1})...`);
   reconnectTimer = setTimeout(() => {
     startTwitchChatConnection();
-  }, delayMs);
+  }, computedDelay);
 }
 
 /**
@@ -663,6 +848,7 @@ async function startTwitchChatConnection(customWsUrl = null) {
         twitchChatState.connected = true;
         twitchChatState.connectedAt = new Date().toISOString();
         twitchChatState.lastError = null;
+        twitchChatState.reconnectCount = 0; // Reset reconnect count on successful connection
         console.log(`[Twitch Chat] EventSub session established (ID: ${sessionId}). Keepalive: ${keepaliveSeconds}s`);
 
         resetKeepaliveWatchdog(keepaliveSeconds);
@@ -672,7 +858,7 @@ async function startTwitchChatConnection(customWsUrl = null) {
           isReconnectingSession = false;
           console.log('[Twitch Chat] Reconnected session active. Subscriptions maintained.');
         } else {
-          // Subscribe to channel.chat.message
+          // Subscribe to all events: channel.chat.message, stream.online, stream.offline
           await subscribeToChannelChatMessage(sessionId);
         }
         return;
@@ -724,6 +910,15 @@ async function startTwitchChatConnection(customWsUrl = null) {
             isMention: analysis.isMention,
             isReplyToBot: analysis.isReplyToBot,
           };
+
+          // 3.5. Timeout Moderation Command check
+          // Commands such as: @jaafarbot timeout @username 10m [reason]
+          // Processed strictly deterministically without Gemini, with permission checks
+          const timeoutCmd = parseTimeoutCommand(messageText, twitchAuthState.user?.login);
+          if (timeoutCmd && timeoutCmd.isCommand) {
+            await handleTimeoutCommand({ chatEvent, timeoutCmd });
+            return;
+          }
 
           // 4. Phase 2 readiness pipeline: Retrieves stream memory, user memory, builds Gemini prompt.
           // Note: Automatic replies are strictly disabled in this stage as requested.
@@ -781,17 +976,18 @@ async function startTwitchChatConnection(customWsUrl = null) {
       twitchChatState.status = 'disconnected';
       console.warn(`[Twitch Chat] WebSocket closed (Code: ${event.code}, Reason: "${event.reason || 'None'}").`);
 
-      // If still authorized and not reconnecting via explicit URL, schedule auto-reconnect
+      // If still authorized and not reconnecting via explicit URL, schedule auto-reconnect with gradual backoff
       if (twitchAuthState.authorized && !isReconnectingSession) {
         twitchChatState.reconnectCount++;
-        scheduleChatReconnect(5000);
+        scheduleChatReconnect();
       }
     };
   } catch (err) {
     console.error('[Twitch Chat] Failed to initiate WebSocket connection:', err?.message || err);
     twitchChatState.lastError = err?.message || 'Failed to initiate WebSocket';
     if (twitchAuthState.authorized) {
-      scheduleChatReconnect(10000);
+      twitchChatState.reconnectCount++;
+      scheduleChatReconnect();
     }
   }
 }
@@ -846,6 +1042,322 @@ async function sendTwitchChatMessage(messageText) {
   } catch (err) {
     console.error('[Twitch API] Error sending chat message:', err?.message || err);
     return { success: false, error: err?.message || err };
+  }
+}
+
+/**
+ * ============================================================================
+ * Twitch Moderation & Timeout System
+ * Official Twitch Helix API: POST https://api.twitch.tv/helix/moderator/bans
+ * Scopes: moderator:manage:banned_users
+ * Permissions: Broadcaster (8jef) or Moderators only
+ * ============================================================================
+ */
+
+/**
+ * Checks if the message sender is the broadcaster or has moderator privileges
+ */
+function isUserModeratorOrBroadcaster(chatEvent) {
+  if (!chatEvent) return false;
+  const chatterLogin = (chatEvent.chatter_user_login || '').toLowerCase();
+  const chatterId = chatEvent.chatter_user_id;
+  const broadcasterId = twitchChatState.broadcaster?.id;
+  const broadcasterLogin = (TWITCH_BROADCASTER_LOGIN || '').toLowerCase();
+
+  // 1. Broadcaster identity check
+  if (chatterId && broadcasterId && chatterId === broadcasterId) return true;
+  if (chatterLogin && broadcasterLogin && chatterLogin === broadcasterLogin) return true;
+  if (chatterLogin === '8jef') return true;
+
+  // 2. Twitch badges check: [{ set_id: 'broadcaster' }, { set_id: 'moderator' }]
+  const badges = chatEvent.badges || [];
+  if (badges.some(b => b.set_id === 'broadcaster' || b.set_id === 'moderator')) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Parses duration string into seconds (e.g. 10s, 1m, 10m, 1h, 1d)
+ * Returns { seconds, readableText } or null if invalid
+ */
+function parseTimeoutDuration(rawDuration) {
+  if (!rawDuration || typeof rawDuration !== 'string') return null;
+  const trimmed = rawDuration.trim();
+  const match = trimmed.match(/^(\d+)\s*(s|sec|seconds?|m|min|minutes?|h|hr|hours?|d|days?)$/i);
+
+  let value = 0;
+  let multiplier = 1;
+  let unitLabel = '';
+
+  if (match) {
+    value = parseInt(match[1], 10);
+    const unit = match[2].toLowerCase();
+
+    if (unit.startsWith('s')) {
+      multiplier = 1;
+      unitLabel = value === 1 ? 'ثانية واحدة' : (value === 2 ? 'ثانيتين' : (value <= 10 ? `${value} ثوانٍ` : `${value} ثانية`));
+    } else if (unit.startsWith('m')) {
+      multiplier = 60;
+      unitLabel = value === 1 ? 'دقيقة واحدة' : (value === 2 ? 'دقيقتين' : (value <= 10 ? `${value} دقائق` : `${value} دقيقة`));
+    } else if (unit.startsWith('h')) {
+      multiplier = 3600;
+      unitLabel = value === 1 ? 'ساعة واحدة' : (value === 2 ? 'ساعتين' : (value <= 10 ? `${value} ساعات` : `${value} ساعة`));
+    } else if (unit.startsWith('d')) {
+      multiplier = 86400;
+      unitLabel = value === 1 ? 'يوم واحد' : (value === 2 ? 'يومين' : (value <= 10 ? `${value} أيام` : `${value} يوم`));
+    }
+  } else if (/^\d+$/.test(trimmed)) {
+    // Pure integer provided, treat as seconds
+    value = parseInt(trimmed, 10);
+    multiplier = 1;
+    unitLabel = value === 1 ? 'ثانية واحدة' : (value === 2 ? 'ثانيتين' : (value <= 10 ? `${value} ثوانٍ` : `${value} ثانية`));
+  } else {
+    return null;
+  }
+
+  const totalSeconds = value * multiplier;
+  // Twitch Helix API bounds: 1 second to 1,209,600 seconds (14 days)
+  if (isNaN(totalSeconds) || totalSeconds < 1 || totalSeconds > 1209600) {
+    return null;
+  }
+
+  return {
+    seconds: totalSeconds,
+    readableText: unitLabel,
+  };
+}
+
+/**
+ * Parses chat message to detect timeout command
+ * Supported formats:
+ * - @jaafarbot timeout @username 10m [reason]
+ * - !timeout @username 10m [reason]
+ * - جعفر تايم اوت @username 10m [reason]
+ * - جعفر timeout @username 10m [reason]
+ * - !to @username 10m [reason]
+ */
+function parseTimeoutCommand(rawText, botLogin = 'jaafarbot') {
+  if (!rawText || typeof rawText !== 'string') return null;
+  const text = rawText.trim();
+
+  let rest = null;
+
+  // Pattern 1: Command prefix (!timeout, !تايم_اوت, !تايماوت, !to)
+  const prefixMatch = text.match(/^!(?:timeout|تايم_اوت|تايماوت|to)\b\s*(.*)$/i);
+  if (prefixMatch) {
+    rest = prefixMatch[1].trim();
+  } else {
+    // Pattern 2: Mention or name followed by timeout keyword
+    const escapedBotLogin = (botLogin || 'jaafarbot').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const mentionRegex = new RegExp(
+      `^(?:@?${escapedBotLogin}|@?jaafarbot|@?جعفر|يا\\s+جعفر|جعفر)\\s+(?:timeout|تايم\\s*اوت|تايماوت|to)\\b\\s*(.*)$`,
+      'i'
+    );
+    const mentionMatch = text.match(mentionRegex);
+    if (mentionMatch) {
+      rest = mentionMatch[1].trim();
+    }
+  }
+
+  if (rest === null) {
+    return null; // Not a timeout command
+  }
+
+  // If no arguments provided
+  if (!rest) {
+    return {
+      isCommand: true,
+      valid: false,
+      error: 'MISSING_ARGS',
+    };
+  }
+
+  const parts = rest.split(/\s+/);
+  const targetUserRaw = parts[0];
+  const targetUser = targetUserRaw.replace(/^@/, '').trim();
+
+  if (!targetUser) {
+    return {
+      isCommand: true,
+      valid: false,
+      error: 'MISSING_TARGET',
+    };
+  }
+
+  // Duration check
+  if (parts.length < 2) {
+    return {
+      isCommand: true,
+      valid: false,
+      targetUser,
+      error: 'MISSING_DURATION',
+    };
+  }
+
+  const durationRaw = parts[1];
+  const parsedDuration = parseTimeoutDuration(durationRaw);
+
+  if (!parsedDuration) {
+    return {
+      isCommand: true,
+      valid: false,
+      targetUser,
+      durationRaw,
+      error: 'INVALID_DURATION',
+    };
+  }
+
+  const reason = parts.slice(2).join(' ').trim() || null;
+
+  return {
+    isCommand: true,
+    valid: true,
+    targetUser,
+    durationSeconds: parsedDuration.seconds,
+    durationText: parsedDuration.readableText,
+    reason,
+  };
+}
+
+/**
+ * Executes Timeout via Twitch Helix Ban/Timeout API
+ * POST https://api.twitch.tv/helix/moderator/bans?broadcaster_id={broadcaster_id}&moderator_id={moderator_id}
+ */
+async function executeTwitchTimeout({ targetUsername, durationSeconds, durationText, reason, callerName }) {
+  const token = await refreshTwitchTokenIfNeeded();
+  if (!token) {
+    return { success: false, error: 'NO_TOKEN', message: 'توكن تويتش غير متوفر أو منتهي الصلاحية.' };
+  }
+
+  if (!twitchChatState.broadcaster?.id) {
+    return { success: false, error: 'NO_BROADCASTER', message: 'معرف قناة البث غير متوفر حالياً.' };
+  }
+
+  const botUserId = twitchAuthState.user?.id;
+  if (!botUserId) {
+    return { success: false, error: 'NO_BOT_ID', message: 'معرف حساب البوت غير متوفر.' };
+  }
+
+  const broadcasterId = twitchChatState.broadcaster.id;
+
+  // 1. Resolve target user details from Twitch
+  const targetUser = await fetchTwitchUserInfoByLogin(targetUsername);
+  if (!targetUser || !targetUser.id) {
+    return { success: false, error: 'USER_NOT_FOUND', message: `لم يتم العثور على المستخدم @${targetUsername} في تويتش.` };
+  }
+
+  // 2. Protection: Prevent timing out broadcaster or the bot itself
+  if (targetUser.id === broadcasterId) {
+    return { success: false, error: 'CANNOT_TIMEOUT_BROADCASTER', message: 'لا يمكن إعطاء تايم اوت لصاحب القناة!' };
+  }
+  if (targetUser.id === botUserId) {
+    return { success: false, error: 'CANNOT_TIMEOUT_BOT', message: 'ما أقدر أعطي تايم اوت لنفسي يا كابتن!' };
+  }
+
+  // 3. Call Twitch Helix Ban/Timeout API
+  try {
+    const url = `https://api.twitch.tv/helix/moderator/bans?broadcaster_id=${encodeURIComponent(broadcasterId)}&moderator_id=${encodeURIComponent(botUserId)}`;
+    const reasonText = reason ? `${reason} (بواسطة @${callerName})` : `Timeout بواسطة @${callerName} عبر جعفر`;
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Client-Id': TWITCH_CLIENT_ID,
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        data: {
+          user_id: targetUser.id,
+          duration: durationSeconds,
+          reason: reasonText.slice(0, 500),
+        },
+      }),
+    });
+
+    if (res.status === 200 || res.status === 204) {
+      console.log(`[Twitch Moderation] Timeout executed: @${targetUsername} for ${durationSeconds}s by @${callerName}`);
+      return {
+        success: true,
+        targetDisplayName: targetUser.displayName || targetUsername,
+        durationText,
+      };
+    }
+
+    const errBody = await res.text();
+    console.error(`[Twitch Moderation] Timeout API failed (HTTP ${res.status}): ${errBody}`);
+
+    let friendlyError = 'فشل تنفيذ التايم اوت بسبب خطأ في تويتش.';
+    if (res.status === 403) {
+      if (errBody.includes('moderator') || errBody.includes('not a moderator')) {
+        friendlyError = 'جعفر يحتاج صلاحية مشرف (Mod) في القناة. اكتب في الشات /mod jaafarbot ثم أعد المحاولة.';
+      } else if (errBody.includes('scope') || errBody.includes('moderator:manage:banned_users')) {
+        friendlyError = 'رمز التفويض ينقصه تصريح (moderator:manage:banned_users). يرجى زيارة /auth/twitch لتحديث الصلاحيات.';
+      } else {
+        friendlyError = 'لا يمكن إعطاء تايم اوت لهذا المستخدم (قد يكون مشرفاً في القناة).';
+      }
+    } else if (res.status === 401) {
+      friendlyError = 'انتهت صلاحية الجلسة، يرجى إعادة توثيق البوت عبر /auth/twitch.';
+    } else if (res.status === 400) {
+      friendlyError = 'طلب التايم اوت غير صالح أو المدة غير مقبولة لتويتش.';
+    }
+
+    return { success: false, status: res.status, error: errBody, message: friendlyError };
+  } catch (err) {
+    console.error('[Twitch Moderation] Error executing timeout:', err?.message || err);
+    return { success: false, error: err?.message || err, message: 'حدث خطأ في الاتصال أثناء تنفيذ التايم اوت.' };
+  }
+}
+
+/**
+ * Handles incoming timeout command deterministically with permission checks
+ */
+async function handleTimeoutCommand({ chatEvent, timeoutCmd }) {
+  const chatterName = chatEvent.chatter_user_name || chatEvent.chatter_user_login || 'المستخدم';
+  const chatterLogin = chatEvent.chatter_user_login || '';
+
+  // 1. Permission Check: Broadcaster or Moderator only
+  const isAuthorized = isUserModeratorOrBroadcaster(chatEvent);
+  if (!isAuthorized) {
+    console.warn(`[Twitch Moderation] Unauthorized timeout attempt by regular chatter @${chatterLogin}`);
+    await sendTwitchChatMessage(`@${chatterName} عذراً، أمر التايم اوت متاح فقط لصاحب البث (8jef) والمشرفين (Mods).`);
+    return;
+  }
+
+  // 2. Syntax & Argument Validation Check
+  if (!timeoutCmd.valid) {
+    if (timeoutCmd.error === 'MISSING_DURATION' || timeoutCmd.error === 'MISSING_ARGS') {
+      await sendTwitchChatMessage(`@${chatterName} يجب تحديد مدة التايم اوت (مثال: 10s, 1m, 10m, 1h). الاستخدام: @jaafarbot timeout @username 10m [السبب]`);
+      return;
+    }
+    if (timeoutCmd.error === 'INVALID_DURATION') {
+      await sendTwitchChatMessage(`@${chatterName} مدة التايم اوت غير صحيحة "${timeoutCmd.durationRaw}". الصيغ المدعومة: 10s (ثوانٍ), 1m (دقيقة), 10m (عشر دقائق), 1h (ساعة).`);
+      return;
+    }
+    if (timeoutCmd.error === 'MISSING_TARGET') {
+      await sendTwitchChatMessage(`@${chatterName} يرجى تحديد اسم المستخدم المطلوب إعطاؤه تايم اوت. مثال: @jaafarbot timeout @username 10m`);
+      return;
+    }
+    return;
+  }
+
+  // 3. Execute via Twitch Helix API
+  console.log(`[Twitch Moderation] Mod @${chatterLogin} requested timeout for @${timeoutCmd.targetUser} (${timeoutCmd.durationText})`);
+  const result = await executeTwitchTimeout({
+    targetUsername: timeoutCmd.targetUser,
+    durationSeconds: timeoutCmd.durationSeconds,
+    durationText: timeoutCmd.durationText,
+    reason: timeoutCmd.reason,
+    callerName: chatterName,
+  });
+
+  if (result.success) {
+    const reasonMsg = timeoutCmd.reason ? ` (السبب: ${timeoutCmd.reason})` : '';
+    await sendTwitchChatMessage(`🚫 تم إعطاء تايم اوت للمستخدم @${result.targetDisplayName} لمدة ${result.durationText}${reasonMsg} بواسطة المشرف @${chatterName}.`);
+  } else {
+    await sendTwitchChatMessage(`@${chatterName} ⚠️ ${result.message || 'تعذر تنفيذ التايم اوت.'}`);
   }
 }
 
@@ -1681,7 +2193,7 @@ app.get('/auth/twitch/callback', async (req, res) => {
     const accountId = userData ? userData.id : '';
     const profileImage = userData ? userData.profile_image_url : '';
 
-    // 6. Save authentication state securely in server memory
+    // 6. Save authentication state securely in server memory and persistent disk
     // NEVER expose accessToken or refreshToken to logs or client HTML
     twitchAuthState = {
       authorized: true,
@@ -1697,6 +2209,8 @@ app.get('/auth/twitch/callback', async (req, res) => {
       refreshToken: tokenData.refresh_token,
       connectedAt: new Date().toISOString(),
     };
+
+    saveTwitchAuthStateToDisk();
 
     console.log(`[Twitch OAuth] Successfully authorized Twitch account: @${accountLogin} (${accountDisplayName})`);
 
@@ -1856,11 +2370,25 @@ app.get('/auth/twitch/callback', async (req, res) => {
       </div>
       <div class="info-row">
         <span class="info-label">الصلاحيات:</span>
-        <span class="info-val" style="font-family: monospace; font-size: 11px;">user:read:chat user:write:chat user:bot</span>
+        <span class="info-val" style="font-family: monospace; font-size: 11px;">user:read:chat user:write:chat user:bot moderator:manage:banned_users</span>
       </div>
       <div class="info-row">
-        <span class="info-label">تخزين التوكن:</span>
-        <span class="info-val" style="color: #065F46;">محفوظ بأمان في الذاكرة ✓</span>
+        <span class="info-label">حالة الجلسة:</span>
+        <span class="info-val" style="color: #065F46;">نشطة ومتصلة بالـ WebSocket ✓</span>
+      </div>
+    </div>
+
+    <!-- Render Free Persistent Token Setup Box -->
+    <div style="background: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 12px; padding: 16px; margin-bottom: 20px; text-align: right;">
+      <div style="display: flex; align-items: center; gap: 6px; color: #166534; font-size: 13px; font-weight: 700; margin-bottom: 6px;">
+        <span>📌</span> الحفاظ على الربط دائمًا في Render المجاني (بدون Disks مدفوعة):
+      </div>
+      <p style="color: #15803D; font-size: 12px; line-height: 1.5; margin-bottom: 10px;">
+        لإبقاء ربط جعفر دائمًا حتى بعد نوم السيرفر (Render Sleep) أو إعادة التشغيل، أضف هذا المتغير في <strong>Environment Variables</strong> في لوحة تحكم Render:
+      </p>
+      <div style="background: white; border: 1px solid #86EFAC; border-radius: 8px; padding: 10px; display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+        <code style="font-family: monospace; font-size: 11px; color: #166534; word-break: break-all; text-align: left; direction: ltr; flex: 1;">TWITCH_REFRESH_TOKEN=${tokenData.refresh_token}</code>
+        <button id="copyBtn" onclick="navigator.clipboard.writeText('${tokenData.refresh_token}'); this.innerText='تم النسخ ✓';" style="background: #166534; color: white; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; white-space: nowrap;">نسخ الـ Token</button>
       </div>
     </div>
 
@@ -1883,6 +2411,7 @@ app.get('/auth/twitch/callback', async (req, res) => {
  * with account identity details. Never exposes access or refresh tokens.
  */
 app.get('/auth/twitch/status', (req, res) => {
+  const hasRefreshTokenInEnv = Boolean(process.env.TWITCH_REFRESH_TOKEN && process.env.TWITCH_REFRESH_TOKEN.trim());
   if (twitchAuthState.authorized && twitchAuthState.user) {
     const expiresInSeconds = Math.max(0, Math.round((twitchAuthState.expiresAt - Date.now()) / 1000));
     return res.status(200).json({
@@ -1896,6 +2425,8 @@ app.get('/auth/twitch/status', (req, res) => {
       scopes: twitchAuthState.scopes,
       connectedAt: twitchAuthState.connectedAt,
       tokenExpiresInSeconds: expiresInSeconds,
+      hasRefreshTokenInEnv,
+      hasSavedTokenOnDisk: hasSavedTwitchAuth(),
     });
   }
 
@@ -1905,6 +2436,8 @@ app.get('/auth/twitch/status', (req, res) => {
     configuredClientId: Boolean(TWITCH_CLIENT_ID),
     configuredClientSecret: Boolean(TWITCH_CLIENT_SECRET),
     redirectUri: TWITCH_REDIRECT_URI,
+    hasRefreshTokenInEnv,
+    hasSavedTokenOnDisk: hasSavedTwitchAuth(),
   });
 });
 
@@ -1979,6 +2512,9 @@ app.get('/api/twitch/chat/status', (req, res) => {
       hasClientId: Boolean(TWITCH_CLIENT_ID),
       hasClientSecret: Boolean(TWITCH_CLIENT_SECRET),
       hasBroadcasterLogin: Boolean(TWITCH_BROADCASTER_LOGIN),
+      hasRefreshTokenInEnv: Boolean(process.env.TWITCH_REFRESH_TOKEN && process.env.TWITCH_REFRESH_TOKEN.trim()),
+      hasSavedTokenOnDisk: hasSavedTwitchAuth(),
+      storagePath: getTwitchStorageFilePath(),
     },
   });
 });
@@ -2526,19 +3062,21 @@ app.get('/', (req, res) => {
 });
 
 // Start listening
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, '0.0.0.0', async () => {
   console.log(`[Twitch AI Server] Running on http://0.0.0.0:${PORT}`);
   console.log(`[Twitch AI Server] Model: ${MODEL_NAME}`);
 
-  // Twitch Chat EventSub WebSocket initialization check
-  if (twitchAuthState.authorized) {
-    console.log('[Twitch Chat] Bot account authorized at startup. Connecting to Twitch Chat EventSub...');
-    startTwitchChatConnection();
-  } else {
-    console.log('[Twitch Chat] Bot account is not authorized yet. Visit /auth/twitch to link account.');
-    if (!TWITCH_BROADCASTER_LOGIN) {
-      console.log('[Twitch Chat] Notice: TWITCH_BROADCASTER_LOGIN environment variable is not configured.');
+  // Restore OAuth session from persistent storage if available
+  try {
+    const restored = await restoreTwitchAuthAndConnect();
+    if (!restored) {
+      console.log('[Twitch Chat] Bot account is not authorized yet. Visit /auth/twitch to link account.');
+      if (!TWITCH_BROADCASTER_LOGIN) {
+        console.log('[Twitch Chat] Notice: TWITCH_BROADCASTER_LOGIN environment variable is not configured.');
+      }
     }
+  } catch (err) {
+    console.error('[Twitch Storage] Error restoring OAuth session on startup:', err?.message || err);
   }
 });
 
