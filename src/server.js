@@ -312,9 +312,9 @@ function getStreamContextRetrieval(maxRecent = 10) {
 /**
  * Phase 2 Readiness Pipeline:
  * Prepared to generate replies using mentions, replies, stream memory, user memory, and Gemini.
- * AUTO-REPLY IS DISABLED AS ORDERED FOR THIS STAGE.
+ * AUTO-REPLY IS ENABLED FOR TWITCH CHAT.
  */
-const AUTO_REPLY_TO_TWITCH_CHAT = false;
+const AUTO_REPLY_TO_TWITCH_CHAT = true;
 
 async function prepareJaafarChatReplyPipeline({ chatEvent, analysis, record }) {
   if (!analysis.isMention && !analysis.isReplyToBot) {
@@ -356,7 +356,7 @@ async function prepareJaafarChatReplyPipeline({ chatEvent, analysis, record }) {
   promptText += 'رد عليه بأسلوب جعفر العفوي والمحبوب، وبشكل مختصر جداً مناسب للشات.';
 
   const isGeminiReady = Boolean(getGeminiClient());
-  console.log(`[Jaafar Pipeline] Retrieval & Prompt Ready (${promptText.length} chars). Gemini Ready: ${isGeminiReady}. Auto-reply is OFF. Armed and ready for Phase 2.`);
+  console.log(`[Jaafar Pipeline] Retrieval & Prompt Ready (${promptText.length} chars). Gemini Ready: ${isGeminiReady}. Auto-reply is ${AUTO_REPLY_TO_TWITCH_CHAT ? 'ON' : 'OFF'}.`);
 
   if (!AUTO_REPLY_TO_TWITCH_CHAT) {
     return;
