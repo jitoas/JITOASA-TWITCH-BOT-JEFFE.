@@ -21,6 +21,7 @@ const TWITCH_SCOPES = [
   'user:write:chat',
   'user:bot',
   'moderator:manage:banned_users',
+  'moderator:read:followers',
 ];
 
 // Target Broadcaster Twitch Channel Name (configured via environment variable)
@@ -338,6 +339,7 @@ let twitchChatState = {
     chatMessage: { status: 'none', id: null },
     streamOnline: { status: 'none', id: null },
     streamOffline: { status: 'none', id: null },
+    channelFollow: { status: 'none', id: null },
   },
   connectedAt: null,
   reconnectCount: 0,
@@ -1208,7 +1210,20 @@ async function subscribeToAllTwitchEvents(sessionId) {
   });
   twitchChatState.subscriptions.streamOffline = offlineSub;
 
-  const hasAnyFailure = [chatSub, onlineSub, offlineSub].some(s => s.status === 'failed');
+  // 4. channel.follow (version 2: requires moderator_user_id)
+  const followSub = await subscribeToSingleEventSub({
+    sessionId,
+    type: 'channel.follow',
+    version: '2',
+    condition: {
+      broadcaster_user_id: broadcasterId,
+      moderator_user_id: botUserId,
+    },
+    token,
+  });
+  twitchChatState.subscriptions.channelFollow = followSub;
+
+  const hasAnyFailure = [chatSub, onlineSub, offlineSub, followSub].some(s => s.status === 'failed');
   if (hasAnyFailure) {
     twitchChatState.lastError = 'One or more EventSub subscriptions failed.';
   } else {
@@ -1462,6 +1477,13 @@ async function startTwitchChatConnection(customWsUrl = null) {
           endCurrentStreamSession();
           return;
         }
+
+        // D. Channel Follow event (welcomes new follower with fixed friendly message)
+        if (subType === 'channel.follow') {
+          const followEvent = data.payload?.event;
+          await handleTwitchFollowEvent(followEvent);
+          return;
+        }
         return;
       }
 
@@ -1475,6 +1497,8 @@ async function startTwitchChatConnection(customWsUrl = null) {
           twitchChatState.subscriptions.streamOnline.status = 'failed';
         } else if (revokedType === 'stream.offline') {
           twitchChatState.subscriptions.streamOffline.status = 'failed';
+        } else if (revokedType === 'channel.follow') {
+          twitchChatState.subscriptions.channelFollow.status = 'failed';
         }
         twitchChatState.lastError = `Subscription ${revokedType} revoked: ${data.payload?.subscription?.status}`;
       }
@@ -2441,6 +2465,60 @@ async function handleBanCommand({ chatEvent, banCmd }) {
     await sendTwitchChatMessage(`⛔ تم حظر المستخدم @${result.targetDisplayName} نهائياً (Permanent Ban)${reasonMsg} بواسطة @${chatterName}.`);
   } else {
     await sendTwitchChatMessage(`@${chatterName} ⚠️ ${result.message || 'تعذر تنفيذ الباند.'}`);
+  }
+}
+
+/**
+ * ============================================================================
+ * Twitch Follow Event & Auto Welcome System
+ * EventSub: channel.follow (version 2)
+ * Message format: "🎉 يا هلا بـ @USERNAME، نورتنا!"
+ * Deterministic: Static text, no Gemini invocation, deduplication protected.
+ * ============================================================================
+ */
+const welcomedFollowers = new Set();
+const MAX_WELCOMED_FOLLOWERS_CACHE = 1000;
+
+async function handleTwitchFollowEvent(followEvent) {
+  if (!followEvent) return;
+
+  const followerLogin = (followEvent.user_login || '').trim().toLowerCase();
+  const followerName = (followEvent.user_name || followEvent.user_login || '').trim();
+  const followerId = followEvent.user_id ? String(followEvent.user_id).trim() : null;
+  const dedupKey = followerId || followerLogin;
+
+  if (!followerName || !dedupKey) {
+    console.warn('[Follow] Received follow event without valid user identifier.');
+    return;
+  }
+
+  console.log(`[Follow] New follower: ${followerName}`);
+
+  // Deduplication check: prevent greeting the same follow multiple times
+  if (welcomedFollowers.has(dedupKey)) {
+    console.log(`[Follow] Follower @${followerName} (${dedupKey}) already welcomed recently. Skipping duplicate message.`);
+    return;
+  }
+
+  // Register in deduplication set
+  welcomedFollowers.add(dedupKey);
+  if (welcomedFollowers.size > MAX_WELCOMED_FOLLOWERS_CACHE) {
+    const firstItem = welcomedFollowers.values().next().value;
+    if (firstItem) welcomedFollowers.delete(firstItem);
+  }
+
+  // Static welcome message without Gemini
+  const welcomeMessage = `🎉 يا هلا بـ @${followerName}، نورتنا!`;
+
+  try {
+    const sendResult = await sendTwitchChatMessage(welcomeMessage);
+    if (sendResult.success) {
+      console.log('[Follow] Welcome message sent');
+    } else {
+      console.error('[Follow] Failed to send welcome message:', sendResult.error);
+    }
+  } catch (err) {
+    console.error('[Follow] Error sending welcome message:', err?.message || err);
   }
 }
 
@@ -5350,6 +5428,7 @@ app.get('/api/twitch/chat/status', (req, res) => {
       chatMessage: twitchChatState.subscriptions.chatMessage,
       streamOnline: twitchChatState.subscriptions.streamOnline,
       streamOffline: twitchChatState.subscriptions.streamOffline,
+      channelFollow: twitchChatState.subscriptions.channelFollow,
     },
     streamSession: {
       active: currentStreamSession.active,
