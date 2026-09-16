@@ -2609,13 +2609,12 @@ async function processAiQueryEngine({ query, username = 'global' }) {
 
     const userState = getUserState(userKey);
 
-    // Prepare multi-turn contents with recent history for context
-    const conversationContents = [
-      ...userState.history.slice(-MAX_HISTORY_MESSAGES),
-      { role: 'user', parts: [{ text: userMessage }] },
-    ];
-
+    // Base system instruction
     let systemInstruction = SYSTEM_INSTRUCTION;
+
+    // Inject current date & time (Asia/Riyadh) into base instructions
+    const currentSaudiTime = getSaudiTimeContext();
+    systemInstruction += `\n\n[معلومات التوقيت والتاريخ الحالي]:\nالتاريخ اليوم بتوقيت الرياض (السعودية) هو: ${currentSaudiTime.dateArabic} (${currentSaudiTime.isoDate})، والساعة الآن: ${currentSaudiTime.timeArabic}. اعتمد هذا التاريخ والوقت كحقيقة مطلقة وحيدة لأي سؤال عن اليوم أو التاريخ أو الوقت الحالي.`;
 
     // Inject Twitch Live Stream Visual Memory into system instruction
     const visualContext = getVisualMemoryContext(6);
@@ -2627,6 +2626,9 @@ async function processAiQueryEngine({ query, username = 'global' }) {
       systemInstruction += `\n\nتنبيه خاص للمحادثة الحالية: المتابع الذي يكلمك الآن عبر الأمر هو "جيتو" (مطورك وصانعك وأفضل مود في القناة، حسابه في تويتش هو @${rawUser}). خاطبه وناده باسم "جيتو" دائماً في ردك (مثال: "هلا يا جيتو"، "أبشر يا جيتو"، "كفو يا جيتو")، وعامله بمكانته الخاصة كصانعك، واجعل الرد مختصراً ومناسباً لسرعة شات تويتش.`;
     }
 
+    // Prepare multi-turn contents with recent history for context
+    let enrichedUserMessage = userMessage;
+
     // Check if user query requires general web search (matches, news, fresh info)
     if (WEB_SEARCH_ENABLED && needsWebSearch(userMessage)) {
       try {
@@ -2634,11 +2636,18 @@ async function processAiQueryEngine({ query, username = 'global' }) {
         const searchPromptBlock = formatWebSearchResultsContext(searchResult);
         if (searchPromptBlock) {
           systemInstruction += `\n\n${searchPromptBlock}`;
+          // Also append directly to the current user turn so Gemini is strictly grounded in the fresh search
+          enrichedUserMessage = `${userMessage}\n\n${searchPromptBlock}`;
         }
       } catch (searchErr) {
         console.error('[Twitch AI] Web search non-fatal error:', searchErr?.message || searchErr);
       }
     }
+
+    const conversationContents = [
+      ...userState.history.slice(-MAX_HISTORY_MESSAGES),
+      { role: 'user', parts: [{ text: enrichedUserMessage }] },
+    ];
 
     // Standard generation configuration
     const generationConfig = {
