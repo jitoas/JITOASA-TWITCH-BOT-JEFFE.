@@ -2543,7 +2543,41 @@ function isInsultOrProvocation(rawText) {
 }
 
 /**
- * Evaluates chat event against Auto-Mod rules and executes 60s timeout if repeated threshold met
+ * Detects if a chat message clearly challenges Jaafar to timeout or ban the user
+ * (e.g. "تايم إذا تقدر", "يلا تايم", "أتحداك تعطيني تايم", "تايمني", "باندني إذا تقدر", "أتحداك تبندني", "ورني الباند")
+ */
+function isPunishmentChallenge(rawText) {
+  if (!rawText || typeof rawText !== 'string') return false;
+  const t = normalizeTextForAutoMod(rawText);
+
+  // 1. Direct inflection verbs (e.g. تايمني, تيموني, باندني, بندني, تبندني)
+  if (/(?:^|\s)(?:تايمني|تيموني|باندني|بندني|تبندني)(?:$|\s|[!?.،,])/i.test(t)) {
+    return true;
+  }
+
+  // 2. Clear challenge phrases combining challenge keywords + timeout/ban terms
+  const challengePatterns = [
+    // تايم / باند إذا تقدر / لو تقدر / ورني / الحين
+    /(?:تايم|تايم\s*اوت|تايموت|باند|بان|بند)\s*(?:يا\s*جعفر|يا\s*بوت)?\s*(?:اذا\s*تقدر|لو\s*تقدر|ان\s*كنت\s*تقدر|يلا|ورني|ورنا|الحين|ذلحين|الان)/i,
+    // يلا تايم / يلا باند / يلا عطني تايم / يلا عطني باند
+    /(?:يلا|يلا\s*عطني|يلا\s*سو|يلا\s*ورني)\s*(?:يا\s*جعفر|يا\s*بوت)?\s*(?:تايم|تايم\s*اوت|تايموت|باند|بان|بند)(?:$|\s|[!?.،,])/i,
+    // اتحداك تعطيني تايم / اتحداك تبندني / جرب تبندني / تقدر تبندني / ورني الباند
+    /(?:اتحداك|اتحدى|جرب|ورني|ورنا|تقدر)\s*(?:يا\s*جعفر|يا\s*بوت)?\s*(?:تعطيني|تسوي|تبند|تبندني|تعطي|تسويلي|تعطينا)?\s*(?:الباند|التايم|التايم\s*اوت|التايموت|البان|تايم|تايم\s*اوت|تايموت|باند|بان|بند)/i,
+    // عطني تايم / اعطيني باند / عطني باند
+    /(?:عطني|اعطني|اديني|سولي|سو\s*لي)\s*(?:يا\s*جعفر|يا\s*بوت)?\s*(?:تايم|تايم\s*اوت|تايموت|باند|بان|بند)\s*(?:اذا\s*تقدر|لو\s*تقدر|يلا|ورني|الحين|ذلحين|الان)?/i,
+    // ورني الباند / ورني التايم
+    /(?:ورني|ورنا)\s*(?:الباند|التايم|التايم\s*اوت|التايموت|البان)(?:$|\s|[!?.،,])/i,
+    // English challenge phrases
+    /\b(?:timeout\s+me|ban\s+me|dare\s+you\s+to\s+(?:ban|timeout)|try\s+to\s+(?:ban|timeout)\s+me|(?:ban|timeout)\s+me\s+if\s+you\s+can)\b/i,
+  ];
+
+  return challengePatterns.some(regex => regex.test(t));
+}
+
+/**
+ * Evaluates chat event against Auto-Mod rules:
+ * 1. Immediate 60s timeout for challenging Jaafar to punish (تايم إذا تقدر, باندني, أتحداك تبندني, ...)
+ * 2. Repeated insult/provocation 60s timeout after multiple strikes within sliding window.
  */
 async function processAutoModForChatEvent(chatEvent) {
   if (!chatEvent) return false;
@@ -2561,33 +2595,61 @@ async function processAutoModForChatEvent(chatEvent) {
     return false;
   }
 
-  // 2. Deterministic insult / provocation detection
-  if (!isInsultOrProvocation(messageText)) {
-    return false;
-  }
-
   const now = Date.now();
 
-  // 3. Log individual detected insult/warning
-  console.log(`[Auto-Mod] Warning/insult detected: ${chatterName}`);
-
-  // 4. Retrieve or initialize user violation record
+  // Retrieve or initialize user violation record
   let record = autoModViolations.get(chatterLogin);
   if (!record) {
     record = { strikes: [], lastTimeoutAt: 0 };
     autoModViolations.set(chatterLogin, record);
   }
 
-  // 5. Cooldown check: prevent multiple timeouts for the same streak
+  // Cooldown check: prevent multiple timeouts for the same streak
   if (record.lastTimeoutAt && (now - record.lastTimeoutAt < AUTO_MOD_COOLDOWN_MS)) {
     return false;
   }
 
-  // 6. Filter strikes within sliding window
+  // 2. Rule 1: Direct Punishment Challenge (Immediate 60s Timeout without warnings or repetition)
+  if (isPunishmentChallenge(messageText)) {
+    console.log(`[Auto-Mod] Punishment challenge detected: ${chatterName}`);
+    console.log(`[Auto-Mod] Timeout 60s: ${chatterName}`);
+
+    record.lastTimeoutAt = now;
+    record.strikes = [];
+
+    const botUserId = twitchAuthState.user?.id ? String(twitchAuthState.user.id).trim() : null;
+    try {
+      const timeoutRes = await executeTwitchTimeout({
+        targetUsername: chatterLogin,
+        durationSeconds: AUTO_MOD_TIMEOUT_SECONDS,
+        durationText: `${AUTO_MOD_TIMEOUT_SECONDS}s`,
+        reason: 'Auto-Mod: تحدي جعفر بالعقوبة (تايم/باند)',
+        callerName: 'jaafarbot (Auto-Mod)',
+        callerId: botUserId,
+      });
+
+      if (timeoutRes.success) {
+        return true;
+      }
+    } catch (err) {
+      console.error(`[Auto-Mod] Failed to execute challenge timeout for @${chatterLogin}:`, err?.message || err);
+    }
+    return false;
+  }
+
+  // 3. Rule 2: Insult / Provocation (Requires repeated violations within sliding window)
+  if (!isInsultOrProvocation(messageText)) {
+    return false;
+  }
+
+  // Log individual detected insult/warning
+  console.log(`[Auto-Mod] Warning/insult detected: ${chatterName}`);
+
+  // Filter strikes within sliding window
   record.strikes = (record.strikes || []).filter(ts => (now - ts) <= AUTO_MOD_WINDOW_MS);
   record.strikes.push(now);
 
-  // 7. Check if repeated violation threshold reached
+  // Check if repeated violation threshold reached
   if (record.strikes.length >= AUTO_MOD_THRESHOLD) {
     console.log(`[Auto-Mod] Repeated provocation detected: ${chatterName}`);
     console.log(`[Auto-Mod] Timeout 60s: ${chatterName}`);
