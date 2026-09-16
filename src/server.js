@@ -333,7 +333,7 @@ let twitchChatState = {
  * stream.offline -> Marks session ended & archives
  * ============================================================================
  */
-const MAX_SESSION_MESSAGES = 400;
+const MAX_SESSION_MESSAGES = 600;
 const MAX_PAST_SESSIONS = 5;
 
 let currentStreamSession = {
@@ -342,7 +342,7 @@ let currentStreamSession = {
   startedAt: null,
   endedAt: null,
   type: 'none', // 'live' | 'pre_stream'
-  messages: [], // Array of { id, userId, userLogin, userName, text, timestamp, isMention, isReplyToBot, replyParent }
+  messages: [], // Array of { id, userId, userLogin, userName, text, color, badges, isBroadcaster, isModerator, isVip, isSubscriber, isJito, timestamp, timeFormatted, isMention, isReplyToBot, replyParent }
   visualMemory: [], // Array of { timestamp, timeFormatted, summary, game, title }
   streamInfo: null,
   stats: {
@@ -352,6 +352,36 @@ let currentStreamSession = {
     visualFramesCount: 0,
   },
 };
+
+/**
+ * Active SSE clients listening for real-time Twitch Chat Log (/chat-log)
+ */
+const chatLogClients = new Set();
+
+function broadcastChatLogEvent(payload) {
+  if (chatLogClients.size === 0) return;
+  const rawData = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const client of chatLogClients) {
+    try {
+      client.res.write(rawData);
+    } catch (_) {
+      chatLogClients.delete(client);
+    }
+  }
+}
+
+// SSE Keepalive heartbeat every 20 seconds to prevent network timeout on Render
+setInterval(() => {
+  if (chatLogClients.size === 0) return;
+  const ping = `: ping\n\n`;
+  for (const client of chatLogClients) {
+    try {
+      client.res.write(ping);
+    } catch (_) {
+      chatLogClients.delete(client);
+    }
+  }
+}, 20000);
 
 const pastStreamSessions = [];
 
@@ -406,6 +436,20 @@ function startNewStreamSession(streamEvent = null) {
   visionState.streamWasLive = true;
 
   console.log(`[Twitch Stream] Started fresh stream session: ${currentStreamSession.id} at ${currentStreamSession.startedAt}`);
+
+  // Broadcast to Chat Log SSE clients: stream session started
+  broadcastChatLogEvent({
+    type: 'session_started',
+    sessionId: currentStreamSession.id,
+    startedAt: currentStreamSession.startedAt,
+    streamInfo: currentStreamSession.streamInfo,
+    stats: {
+      totalMessages: 0,
+      sessionMessages: 0,
+      sessionId: currentStreamSession.id,
+      streamActive: true,
+    },
+  });
 }
 
 function endCurrentStreamSession() {
@@ -416,6 +460,19 @@ function endCurrentStreamSession() {
   console.log(`[Twitch Stream] Stream ended. Session ${currentStreamSession.id} closed with ${currentStreamSession.messages.length} messages and ${visualCount} visual frames.`);
   archiveCurrentStreamSession();
   visionState.streamWasLive = false;
+
+  // Broadcast to Chat Log SSE clients: stream session ended
+  broadcastChatLogEvent({
+    type: 'session_ended',
+    sessionId: currentStreamSession.id,
+    endedAt: currentStreamSession.endedAt,
+    stats: {
+      totalMessages: currentStreamSession.stats.totalMessages,
+      sessionMessages: currentStreamSession.messages.length,
+      sessionId: currentStreamSession.id,
+      streamActive: false,
+    },
+  });
 }
 
 function ensureActiveSessionExists() {
@@ -488,13 +545,50 @@ function analyzeChatMessage(chatEvent, botUser) {
 function recordStreamChatMessage(chatEvent, analysis) {
   ensureActiveSessionExists();
 
+  // Extract badges safely
+  const rawBadges = chatEvent.badges || [];
+  const badges = [];
+  for (const b of rawBadges) {
+    if (b && b.set_id) {
+      badges.push(b.set_id);
+    }
+  }
+
+  const broadcasterLogin = (TWITCH_BROADCASTER_LOGIN || '8jef').toLowerCase();
+  const chatterLogin = (chatEvent.chatter_user_login || '').toLowerCase();
+  const chatterId = chatEvent.chatter_user_id || '';
+  const broadcasterId = chatEvent.broadcaster_user_id || '';
+
+  const isBroadcaster = badges.includes('broadcaster') || (broadcasterId && chatterId === broadcasterId) || (chatterLogin && chatterLogin === broadcasterLogin);
+  const isModerator = badges.includes('moderator');
+  const isVip = badges.includes('vip');
+  const isSubscriber = badges.includes('subscriber');
+  const isJito = isJitoChatter(chatEvent);
+
+  const now = new Date();
+  const timeFormatted = now.toLocaleTimeString('en-GB', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+    timeZone: 'Asia/Riyadh',
+  });
+
   const record = {
-    id: chatEvent.message_id || ('msg_' + Date.now()),
-    userId: chatEvent.chatter_user_id,
-    userLogin: chatEvent.chatter_user_login,
-    userName: chatEvent.chatter_user_name,
+    id: chatEvent.message_id || ('msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6)),
+    userId: chatterId,
+    userLogin: chatterLogin,
+    userName: chatEvent.chatter_user_name || chatEvent.chatter_user_login || 'unknown',
     text: chatEvent.message?.text || '',
-    timestamp: new Date().toISOString(),
+    color: chatEvent.color || null,
+    badges,
+    isBroadcaster,
+    isModerator,
+    isVip,
+    isSubscriber,
+    isJito,
+    timestamp: now.toISOString(),
+    timeFormatted,
     isMention: analysis.isMention,
     isReplyToBot: analysis.isReplyToBot,
     replyParent: analysis.replyParent,
@@ -508,6 +602,18 @@ function recordStreamChatMessage(chatEvent, analysis) {
   if (currentStreamSession.messages.length > MAX_SESSION_MESSAGES) {
     currentStreamSession.messages.shift();
   }
+
+  // Real-time broadcast to all active /chat-log clients
+  broadcastChatLogEvent({
+    type: 'message',
+    message: record,
+    stats: {
+      totalMessages: currentStreamSession.stats.totalMessages,
+      sessionMessages: currentStreamSession.messages.length,
+      sessionId: currentStreamSession.id,
+      streamActive: currentStreamSession.active,
+    },
+  });
 
   return record;
 }
@@ -2477,6 +2583,1078 @@ app.all('/api/vision/capture', async (req, res) => {
 });
 
 /**
+ * ============================================================================
+ * Twitch Live Chat Log & Real-Time Viewer System
+ * Route: /chat-log
+ * Real-Time Stream: /api/chat-log/stream (Server-Sent Events)
+ * Protection: Private access via CHAT_LOG_SECRET
+ * ============================================================================
+ */
+
+function isAuthorizedForChatLog(req) {
+  const secret = (process.env.CHAT_LOG_SECRET || 'jef8-jaafar-chat-log').trim();
+  // 1. Query param ?key=...
+  const queryKey = req.query?.key;
+  if (queryKey && typeof queryKey === 'string' && queryKey.trim() === secret) {
+    return true;
+  }
+  // 2. Custom header
+  const headerKey = req.headers['x-chat-log-key'];
+  if (headerKey && typeof headerKey === 'string' && headerKey.trim() === secret) {
+    return true;
+  }
+  // 3. Cookie check
+  const cookieHeader = req.headers.cookie || '';
+  const match = cookieHeader.match(/(?:^|;\s*)chat_log_key=([^;]+)/);
+  if (match) {
+    try {
+      const val = decodeURIComponent(match[1].trim());
+      if (val === secret) return true;
+    } catch (_) {}
+  }
+  return false;
+}
+
+// Verification Endpoint for Chat Log Password
+app.post('/api/chat-log/verify', express.json(), (req, res) => {
+  const secret = (process.env.CHAT_LOG_SECRET || 'jef8-jaafar-chat-log').trim();
+  const provided = (req.body?.key || req.query?.key || '').trim();
+  if (provided === secret) {
+    res.cookie('chat_log_key', encodeURIComponent(secret), {
+      path: '/',
+      maxAge: 30 * 24 * 60 * 60 * 1000,
+      sameSite: 'lax',
+      httpOnly: false,
+    });
+    return res.json({ success: true, authorized: true });
+  }
+  return res.status(401).json({ success: false, authorized: false, error: 'مفتاح الدخول غير صحيح' });
+});
+
+// SSE Live Stream Endpoint for Chat Log
+app.get('/api/chat-log/stream', (req, res) => {
+  if (!isAuthorizedForChatLog(req)) {
+    return res.status(401).json({ error: 'Unauthorized access to chat log' });
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  if (typeof res.flushHeaders === 'function') {
+    res.flushHeaders();
+  }
+
+  const client = { id: Date.now() + Math.random(), res };
+  chatLogClients.add(client);
+
+  // Send initial state immediately
+  const initPayload = {
+    type: 'init',
+    broadcaster: TWITCH_BROADCASTER_LOGIN || '8jef',
+    sessionId: currentStreamSession.id,
+    streamActive: currentStreamSession.active,
+    startedAt: currentStreamSession.startedAt,
+    messages: currentStreamSession.messages || [],
+    stats: {
+      totalMessages: currentStreamSession.stats.totalMessages,
+      sessionMessages: currentStreamSession.messages.length,
+      streamActive: currentStreamSession.active,
+    },
+  };
+  res.write(`data: ${JSON.stringify(initPayload)}\n\n`);
+
+  req.on('close', () => {
+    chatLogClients.delete(client);
+  });
+});
+
+// Clear Chat Log Endpoint
+app.post('/api/chat-log/clear', (req, res) => {
+  if (!isAuthorizedForChatLog(req)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  currentStreamSession.messages = [];
+  broadcastChatLogEvent({
+    type: 'cleared',
+    stats: {
+      totalMessages: currentStreamSession.stats.totalMessages,
+      sessionMessages: 0,
+      sessionId: currentStreamSession.id,
+      streamActive: currentStreamSession.active,
+    },
+  });
+  return res.json({ success: true, message: 'Chat log cleared' });
+});
+
+// Chat Log Status Endpoint
+app.get('/api/chat-log/status', (req, res) => {
+  const authorized = isAuthorizedForChatLog(req);
+  return res.json({
+    authorized,
+    broadcaster: TWITCH_BROADCASTER_LOGIN || '8jef',
+    streamActive: currentStreamSession.active,
+    sessionId: currentStreamSession.id,
+    messagesCount: authorized ? currentStreamSession.messages.length : null,
+    totalMessages: authorized ? currentStreamSession.stats.totalMessages : null,
+    activeSubscribers: chatLogClients.size,
+  });
+});
+
+// Test / Simulation message injector for Chat Log verification
+app.post('/api/chat-log/test-message', express.json(), (req, res) => {
+  if (!isAuthorizedForChatLog(req)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const username = (req.body?.username || req.query?.username || '4VREN').trim();
+  const text = (req.body?.text || req.query?.text || 'جعفر شوف وش صار').trim();
+  const role = (req.body?.role || req.query?.role || 'moderator').toLowerCase();
+  const color = req.body?.color || (username.toLowerCase() === '4vren' ? '#F59E0B' : '#9146FF');
+
+  const badges = [];
+  if (role === 'broadcaster' || role === 'streamer') badges.push({ set_id: 'broadcaster', id: '1' });
+  if (role === 'moderator' || role === 'mod') badges.push({ set_id: 'moderator', id: '1' });
+  if (role === 'vip') badges.push({ set_id: 'vip', id: '1' });
+  if (role === 'subscriber' || role === 'sub') badges.push({ set_id: 'subscriber', id: '1' });
+
+  const fakeChatEvent = {
+    message_id: 'test_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+    chatter_user_id: username.toLowerCase() === '4vren' ? (jitoIdentity.userId || '12345678') : '98765432',
+    chatter_user_login: username.toLowerCase(),
+    chatter_user_name: username,
+    broadcaster_user_id: '99999999',
+    broadcaster_user_login: (TWITCH_BROADCASTER_LOGIN || '8jef').toLowerCase(),
+    broadcaster_user_name: TWITCH_BROADCASTER_LOGIN || '8jef',
+    message: { text, fragments: [{ type: 'text', text }] },
+    color,
+    badges,
+  };
+
+  const analysis = analyzeChatMessage(fakeChatEvent, twitchAuthState.user);
+  const record = recordStreamChatMessage(fakeChatEvent, analysis);
+
+  return res.json({
+    success: true,
+    message: 'Test message recorded and broadcasted',
+    record,
+    sessionMessagesCount: currentStreamSession.messages.length,
+  });
+});
+
+// GET /chat-log HTML Dashboard Page
+app.get('/chat-log', (req, res) => {
+  const broadcaster = TWITCH_BROADCASTER_LOGIN || '8jef';
+  const hasKeyInQuery = Boolean(req.query?.key);
+
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Twitch Chat Log • #${broadcaster}</title>
+  <style>
+    :root {
+      --bg: #0E0E10;
+      --card-bg: #18181B;
+      --card-header: #1F1F23;
+      --border: #2D2D35;
+      --text: #EFEFF1;
+      --text-muted: #ADADB8;
+      --purple: #9146FF;
+      --purple-hover: #772CE8;
+      --green: #10B981;
+      --red: #EF4444;
+      --amber: #F59E0B;
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--font);
+      background-color: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* Top App Bar */
+    header {
+      background: var(--card-header);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+      z-index: 10;
+    }
+
+    .brand-section {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .brand-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .channel-pill {
+      background: #2D2D35;
+      color: #BF94FF;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 6px;
+      direction: ltr;
+      display: inline-block;
+    }
+
+    .header-indicators {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 12px;
+      flex-wrap: wrap;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 9999px;
+      font-weight: 600;
+      font-size: 11px;
+    }
+    .status-pill.live { background: rgba(239, 68, 68, 0.15); color: #F87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+    .status-pill.offline { background: rgba(173, 173, 184, 0.15); color: var(--text-muted); border: 1px solid var(--border); }
+    .status-pill.connected { background: rgba(16, 185, 129, 0.15); color: #34D399; border: 1px solid rgba(16, 185, 129, 0.3); }
+    .status-pill.disconnected { background: rgba(239, 68, 68, 0.15); color: #F87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+
+    .msg-counter {
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+    .msg-counter strong {
+      color: var(--text);
+      font-family: var(--mono);
+    }
+
+    /* Controls Bar */
+    .controls-bar {
+      background: var(--card-bg);
+      border-bottom: 1px solid var(--border);
+      padding: 8px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .search-wrapper {
+      position: relative;
+      flex: 1;
+      min-width: 200px;
+      max-width: 360px;
+    }
+
+    .search-input {
+      width: 100%;
+      background: #0E0E10;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 7px 12px 7px 30px;
+      color: var(--text);
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .search-input:focus {
+      border-color: var(--purple);
+    }
+    .search-icon {
+      position: absolute;
+      left: 10px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--text-muted);
+      font-size: 13px;
+      pointer-events: none;
+    }
+
+    .actions-wrapper {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      background: #2D2D35;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s;
+    }
+    .btn:hover { background: #393945; }
+    .btn.active { background: var(--purple); border-color: var(--purple); color: white; }
+    .btn-danger:hover { background: rgba(239, 68, 68, 0.2); border-color: var(--red); color: #FCA5A5; }
+
+    .filter-chips {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .filter-chip {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 4px 10px;
+      border-radius: 9999px;
+      font-size: 11px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .filter-chip:hover { color: var(--text); border-color: #4A4A58; }
+    .filter-chip.active { background: #2D2D35; color: #BF94FF; border-color: var(--purple); font-weight: 600; }
+
+    /* Chat Messages Container */
+    #chatContainer {
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      position: relative;
+    }
+
+    /* Message Row */
+    .chat-row {
+      display: flex;
+      align-items: baseline;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 13px;
+      line-height: 1.6;
+      word-break: break-word;
+      transition: background 0.1s;
+    }
+    .chat-row:hover {
+      background: rgba(255, 255, 255, 0.03);
+    }
+    .chat-row.highlight-mention {
+      background: rgba(245, 158, 11, 0.08);
+      border-right: 3px solid var(--amber);
+    }
+
+    .msg-time {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: #6B7280;
+      margin-left: 8px;
+      direction: ltr;
+      display: inline-block;
+      flex-shrink: 0;
+      user-select: none;
+    }
+
+    .badge-chip {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 1px 6px;
+      border-radius: 4px;
+      margin-left: 6px;
+      user-select: none;
+      display: inline-block;
+      flex-shrink: 0;
+    }
+    .badge-broadcaster { background: #772CE8; color: #FFFFFF; }
+    .badge-mod { background: #059669; color: #FFFFFF; }
+    .badge-vip { background: #DB2777; color: #FFFFFF; }
+    .badge-sub { background: #4F46E5; color: #FFFFFF; }
+    .badge-jito { background: #D97706; color: #FFFFFF; font-weight: 800; border: 1px solid #F59E0B; }
+
+    .msg-user {
+      font-weight: 700;
+      margin-left: 6px;
+      flex-shrink: 0;
+      direction: ltr;
+      display: inline-block;
+    }
+
+    .msg-text {
+      color: var(--text);
+      word-break: break-word;
+      direction: auto;
+      flex: 1;
+    }
+
+    /* System Dividers */
+    .sys-divider {
+      text-align: center;
+      margin: 12px 0;
+      position: relative;
+      font-size: 12px;
+      color: var(--text-muted);
+      user-select: none;
+    }
+    .sys-divider::before {
+      content: '';
+      position: absolute;
+      top: 50%;
+      right: 0;
+      left: 0;
+      height: 1px;
+      background: var(--border);
+      z-index: 1;
+    }
+    .sys-divider span {
+      position: relative;
+      z-index: 2;
+      background: var(--bg);
+      padding: 2px 14px;
+      border-radius: 9999px;
+      border: 1px solid var(--border);
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+    .sys-divider.stream-start span { color: #34D399; border-color: rgba(16, 185, 129, 0.3); }
+    .sys-divider.stream-end span { color: #F87171; border-color: rgba(239, 68, 68, 0.3); }
+
+    /* Empty state */
+    .empty-state {
+      margin: auto;
+      text-align: center;
+      color: var(--text-muted);
+      padding: 40px 20px;
+    }
+    .empty-icon { font-size: 36px; margin-bottom: 8px; opacity: 0.7; }
+
+    /* Floating Jump Button */
+    .jump-bottom-btn {
+      position: absolute;
+      bottom: 20px;
+      left: 20px;
+      background: var(--purple);
+      color: white;
+      border: none;
+      border-radius: 9999px;
+      padding: 8px 18px;
+      font-size: 12px;
+      font-weight: 600;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+      cursor: pointer;
+      display: none;
+      align-items: center;
+      gap: 6px;
+      z-index: 20;
+      transition: transform 0.15s;
+    }
+    .jump-bottom-btn:hover { background: var(--purple-hover); transform: translateY(-2px); }
+
+    /* Auth Modal Overlay */
+    #authOverlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.85);
+      backdrop-filter: blur(8px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+      padding: 16px;
+    }
+    .auth-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 28px;
+      max-width: 400px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+    }
+    .auth-card h3 {
+      font-size: 18px;
+      margin-bottom: 8px;
+      color: var(--text);
+    }
+    .auth-card p {
+      font-size: 13px;
+      color: var(--text-muted);
+      margin-bottom: 20px;
+      line-height: 1.5;
+    }
+    .auth-card input {
+      width: 100%;
+      background: #0E0E10;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 14px;
+      color: white;
+      font-size: 14px;
+      outline: none;
+      margin-bottom: 12px;
+      text-align: center;
+      letter-spacing: 2px;
+      font-family: var(--mono);
+    }
+    .auth-card input:focus { border-color: var(--purple); }
+    .auth-card button {
+      width: 100%;
+      background: var(--purple);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .auth-card button:hover { background: var(--purple-hover); }
+    .auth-error {
+      color: #F87171;
+      font-size: 12px;
+      margin-top: 10px;
+      display: none;
+    }
+
+    /* Mobile Responsive Tweaks */
+    @media (max-width: 640px) {
+      header { padding: 8px 12px; }
+      .brand-title { font-size: 13px; }
+      .controls-bar { padding: 6px 12px; }
+      .search-wrapper { max-width: 100%; order: 2; width: 100%; }
+      .actions-wrapper { order: 1; width: 100%; justify-content: space-between; }
+      #chatContainer { padding: 10px 8px; }
+      .chat-row { font-size: 12px; padding: 3px 6px; }
+      .msg-time { font-size: 10px; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top App Bar -->
+  <header>
+    <div class="brand-section">
+      <div class="brand-title">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="#9146FF"><path d="M11.571 4.714h1.715v5.143H11.57zm4.715 0H18v5.143h-1.714zM6 0L1.714 4.286v15.428h5.143V24l4.286-4.286h3.428L22.286 12V0zm14.571 11.143l-3.428 3.428h-3.429l-3 3v-3H6.857V1.714h13.714z"/></svg>
+        سجل شات البث الحي
+      </div>
+      <div class="channel-pill">#${broadcaster}</div>
+    </div>
+
+    <div class="header-indicators">
+      <div id="streamStatusPill" class="status-pill offline">⚪ البث متوقف</div>
+      <div id="connStatusPill" class="status-pill disconnected">● جاري الاتصال...</div>
+      <div class="msg-counter">رسائل الجلسة: <strong id="msgCountDisplay">0</strong></div>
+    </div>
+  </header>
+
+  <!-- Controls Bar -->
+  <div class="controls-bar">
+    <div class="search-wrapper">
+      <input type="text" id="searchInput" class="search-input" placeholder="بحث في الرسائل أو الأسماء..." />
+      <span class="search-icon">🔍</span>
+    </div>
+
+    <div class="actions-wrapper">
+      <div class="filter-chips">
+        <button class="filter-chip active" data-filter="all" onclick="setRoleFilter('all', this)">الكل</button>
+        <button class="filter-chip" data-filter="jito" onclick="setRoleFilter('jito', this)">👑 جيتو</button>
+        <button class="filter-chip" data-filter="mods" onclick="setRoleFilter('mods', this)">🛡️ المودز</button>
+        <button class="filter-chip" data-filter="broadcaster" onclick="setRoleFilter('broadcaster', this)">🟣 الستريمر</button>
+      </div>
+
+      <button id="btnAutoScroll" class="btn active" onclick="toggleAutoScroll()">
+        <span>⬇️</span> التمرير التلقائي
+      </button>
+
+      <button class="btn" title="إرسال رسالة اختبارية لحظية للتأكد من عمل النظام" onclick="sendTestChatMessage()">
+        <span>⚡</span> تجربة
+      </button>
+
+      <button class="btn btn-danger" onclick="clearChatLog()">
+        <span>🗑️</span> مسح
+      </button>
+    </div>
+  </div>
+
+  <!-- Messages List -->
+  <div id="chatContainer">
+    <div id="emptyPlaceholder" class="empty-state">
+      <div class="empty-icon">💬</div>
+      <div>بانتظار وصول رسائل الشات من البث المباشر...</div>
+    </div>
+  </div>
+
+  <!-- Jump to bottom pill -->
+  <button id="btnJumpBottom" class="jump-bottom-btn" onclick="scrollToBottom(true)">
+    <span>↓</span> رسائل جديدة بالأسفل
+  </button>
+
+  <!-- Password Authentication Modal -->
+  <div id="authOverlay">
+    <div class="auth-card">
+      <div style="font-size: 32px; margin-bottom: 12px;">🔒</div>
+      <h3>صفحة سجل الشات خاصة</h3>
+      <p>أدخل مفتاح الدخول المصرح به (<code style="background:#2D2D35; padding:2px 6px; border-radius:4px; font-family:var(--mono); font-size:11px;">CHAT_LOG_SECRET</code>) لمشاهدة الشات مباشرة:</p>
+      <form onsubmit="handleAuthSubmit(event)">
+        <input type="password" id="authKeyInput" placeholder="••••••••••••" autocomplete="current-password" autofocus />
+        <button type="submit" id="btnAuthSubmit">فتح الشات المباشر</button>
+        <div id="authErrorMsg" class="auth-error">مفتاح الدخول غير صحيح، حاول ثانية</div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    // State
+    const allMessages = [];
+    let autoScroll = true;
+    let isUserScrolledUp = false;
+    let activeRoleFilter = 'all';
+    let searchQuery = '';
+    let currentSessionId = null;
+    let sseSource = null;
+
+    // Cache DOM
+    const chatContainer = document.getElementById('chatContainer');
+    const emptyPlaceholder = document.getElementById('emptyPlaceholder');
+    const msgCountDisplay = document.getElementById('msgCountDisplay');
+    const streamStatusPill = document.getElementById('streamStatusPill');
+    const connStatusPill = document.getElementById('connStatusPill');
+    const btnAutoScroll = document.getElementById('btnAutoScroll');
+    const btnJumpBottom = document.getElementById('btnJumpBottom');
+    const searchInput = document.getElementById('searchInput');
+    const authOverlay = document.getElementById('authOverlay');
+    const authKeyInput = document.getElementById('authKeyInput');
+    const authErrorMsg = document.getElementById('authErrorMsg');
+
+    // Get Auth Key from URL or LocalStorage
+    function getStoredKey() {
+      const urlParams = new URLSearchParams(window.location.search);
+      const queryKey = urlParams.get('key');
+      if (queryKey) {
+        localStorage.setItem('chat_log_key', queryKey.trim());
+        return queryKey.trim();
+      }
+      return localStorage.getItem('chat_log_key') || '';
+    }
+
+    // Connect to SSE Stream
+    function initChatStream() {
+      const key = getStoredKey();
+      if (!key) {
+        showAuthModal();
+        return;
+      }
+
+      if (sseSource) {
+        sseSource.close();
+      }
+
+      connStatusPill.className = 'status-pill offline';
+      connStatusPill.innerText = '● جاري الاتصال...';
+
+      const sseUrl = '/api/chat-log/stream?key=' + encodeURIComponent(key);
+      sseSource = new EventSource(sseUrl);
+
+      sseSource.onopen = () => {
+        connStatusPill.className = 'status-pill connected';
+        connStatusPill.innerText = '● متصل لحظياً';
+        hideAuthModal();
+      };
+
+      sseSource.onmessage = (e) => {
+        try {
+          const payload = JSON.parse(e.data);
+          handleStreamPayload(payload);
+        } catch (err) {
+          console.error('[ChatLog] Parse error:', err);
+        }
+      };
+
+      sseSource.onerror = (err) => {
+        connStatusPill.className = 'status-pill disconnected';
+        connStatusPill.innerText = '● انقطع الاتصال';
+        
+        // Test if error is 401 Unauthorized
+        fetch('/api/chat-log/status?key=' + encodeURIComponent(key))
+          .then(res => {
+            if (res.status === 401) {
+              sseSource.close();
+              showAuthModal();
+            }
+          })
+          .catch(() => {});
+      };
+    }
+
+    // Process Incoming SSE Events
+    function handleStreamPayload(payload) {
+      if (!payload || !payload.type) return;
+
+      if (payload.type === 'init') {
+        currentSessionId = payload.sessionId;
+        updateStreamStatus(payload.streamActive);
+        
+        allMessages.length = 0;
+        chatContainer.innerHTML = '';
+        
+        if (Array.isArray(payload.messages) && payload.messages.length > 0) {
+          emptyPlaceholder.style.display = 'none';
+          payload.messages.forEach(msg => {
+            allMessages.push(msg);
+            renderMessageRow(msg, false);
+          });
+          scrollToBottom();
+        } else {
+          chatContainer.appendChild(emptyPlaceholder);
+          emptyPlaceholder.style.display = 'block';
+        }
+        updateCounter(allMessages.length);
+        return;
+      }
+
+      if (payload.type === 'message') {
+        const msg = payload.message;
+        if (!msg) return;
+
+        allMessages.push(msg);
+        emptyPlaceholder.style.display = 'none';
+        renderMessageRow(msg, true);
+        updateCounter(payload.stats?.sessionMessages || allMessages.length);
+
+        if (autoScroll && !isUserScrolledUp) {
+          scrollToBottom();
+        } else {
+          btnJumpBottom.style.display = 'flex';
+        }
+        return;
+      }
+
+      if (payload.type === 'session_started') {
+        updateStreamStatus(true);
+        currentSessionId = payload.sessionId;
+        // Clean chat log for new session
+        allMessages.length = 0;
+        chatContainer.innerHTML = '';
+        renderDivider('━━━ بدأت جلسة بث جديدة ━━━', 'stream-start');
+        updateCounter(0);
+        return;
+      }
+
+      if (payload.type === 'session_ended') {
+        updateStreamStatus(false);
+        renderDivider('━━━ انتهت جلسة البث ━━━', 'stream-end');
+        return;
+      }
+
+      if (payload.type === 'cleared') {
+        allMessages.length = 0;
+        chatContainer.innerHTML = '';
+        chatContainer.appendChild(emptyPlaceholder);
+        emptyPlaceholder.style.display = 'block';
+        updateCounter(0);
+        return;
+      }
+    }
+
+    // Render a Single Message Row
+    function renderMessageRow(msg, checkFilter = true) {
+      if (checkFilter && !matchesCurrentFilter(msg)) {
+        return;
+      }
+
+      const row = document.createElement('div');
+      row.className = 'chat-row';
+      row.id = 'row_' + msg.id;
+      if (msg.isMention || msg.isReplyToBot) {
+        row.classList.add('highlight-mention');
+      }
+
+      // 1. Time
+      const timeSpan = document.createElement('span');
+      timeSpan.className = 'msg-time';
+      timeSpan.innerText = '[' + (msg.timeFormatted || '00:00:00') + ']';
+      row.appendChild(timeSpan);
+
+      // 2. Badges
+      if (msg.isBroadcaster) {
+        const b = document.createElement('span');
+        b.className = 'badge-chip badge-broadcaster';
+        b.innerText = 'ستريمر';
+        row.appendChild(b);
+      }
+      if (msg.isJito) {
+        const b = document.createElement('span');
+        b.className = 'badge-chip badge-jito';
+        b.innerText = 'جيتو 👑';
+        row.appendChild(b);
+      }
+      if (msg.isModerator && !msg.isBroadcaster) {
+        const b = document.createElement('span');
+        b.className = 'badge-chip badge-mod';
+        b.innerText = 'مود';
+        row.appendChild(b);
+      }
+      if (msg.isVip) {
+        const b = document.createElement('span');
+        b.className = 'badge-chip badge-vip';
+        b.innerText = 'VIP';
+        row.appendChild(b);
+      }
+
+      // 3. Username
+      const userSpan = document.createElement('span');
+      userSpan.className = 'msg-user';
+      userSpan.innerText = (msg.userName || msg.userLogin || 'متابع') + ':';
+      if (msg.color) {
+        userSpan.style.color = msg.color;
+      } else {
+        userSpan.style.color = getUserColor(msg.userName || msg.userLogin || '');
+      }
+      row.appendChild(userSpan);
+
+      // 4. Text
+      const textSpan = document.createElement('span');
+      textSpan.className = 'msg-text';
+      textSpan.innerText = msg.text || '';
+      row.appendChild(textSpan);
+
+      chatContainer.appendChild(row);
+    }
+
+    // Render Divider Message
+    function renderDivider(text, typeClass) {
+      const div = document.createElement('div');
+      div.className = 'sys-divider ' + (typeClass || '');
+      const span = document.createElement('span');
+      span.innerText = text;
+      div.appendChild(span);
+      chatContainer.appendChild(div);
+      scrollToBottom();
+    }
+
+    // User Color Generator
+    const USER_COLORS = ['#FF4A4A', '#00FF7F', '#1E90FF', '#FF69B4', '#FFA500', '#9370DB', '#00FFFF', '#FFD700', '#32CD32'];
+    function getUserColor(str) {
+      let hash = 0;
+      for (let i = 0; i < str.length; i++) {
+        hash = str.charCodeAt(i) + ((hash << 5) - hash);
+      }
+      const idx = Math.abs(hash) % USER_COLORS.length;
+      return USER_COLORS[idx];
+    }
+
+    // Filter Logic
+    function matchesCurrentFilter(msg) {
+      // Role filter
+      if (activeRoleFilter === 'jito' && !msg.isJito) return false;
+      if (activeRoleFilter === 'mods' && !msg.isModerator) return false;
+      if (activeRoleFilter === 'broadcaster' && !msg.isBroadcaster) return false;
+
+      // Text search query
+      if (searchQuery) {
+        const q = searchQuery.toLowerCase();
+        const userName = (msg.userName || '').toLowerCase();
+        const userLogin = (msg.userLogin || '').toLowerCase();
+        const text = (msg.text || '').toLowerCase();
+        if (!userName.includes(q) && !userLogin.includes(q) && !text.includes(q)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    function reapplyFilters() {
+      chatContainer.innerHTML = '';
+      let visibleCount = 0;
+
+      allMessages.forEach(msg => {
+        if (matchesCurrentFilter(msg)) {
+          renderMessageRow(msg, false);
+          visibleCount++;
+        }
+      });
+
+      if (visibleCount === 0) {
+        emptyPlaceholder.style.display = 'block';
+        chatContainer.appendChild(emptyPlaceholder);
+      } else {
+        emptyPlaceholder.style.display = 'none';
+        scrollToBottom();
+      }
+    }
+
+    function setRoleFilter(role, btnElem) {
+      activeRoleFilter = role;
+      document.querySelectorAll('.filter-chip').forEach(el => el.classList.remove('active'));
+      if (btnElem) btnElem.classList.add('active');
+      reapplyFilters();
+    }
+
+    searchInput.addEventListener('input', (e) => {
+      searchQuery = e.target.value.trim();
+      reapplyFilters();
+    });
+
+    // Auto-Scroll Handling
+    function scrollToBottom(force = false) {
+      if (force || (autoScroll && !isUserScrolledUp)) {
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+        btnJumpBottom.style.display = 'none';
+        isUserScrolledUp = false;
+      }
+    }
+
+    chatContainer.addEventListener('scroll', () => {
+      const threshold = 80;
+      const isAtBottom = chatContainer.scrollHeight - chatContainer.scrollTop - chatContainer.clientHeight <= threshold;
+      if (isAtBottom) {
+        isUserScrolledUp = false;
+        btnJumpBottom.style.display = 'none';
+      } else {
+        isUserScrolledUp = true;
+      }
+    });
+
+    function toggleAutoScroll() {
+      autoScroll = !autoScroll;
+      if (autoScroll) {
+        btnAutoScroll.classList.add('active');
+        isUserScrolledUp = false;
+        scrollToBottom(true);
+      } else {
+        btnAutoScroll.classList.remove('active');
+      }
+    }
+
+    // Clear Chat Log
+    async function clearChatLog() {
+      if (!confirm('هل أنت متأكد من مسح سجل الشات الحالي؟')) return;
+      const key = getStoredKey();
+      try {
+        await fetch('/api/chat-log/clear?key=' + encodeURIComponent(key), { method: 'POST' });
+      } catch (err) {
+        console.error('Failed to clear log on server:', err);
+      }
+    }
+
+    // Send Test Message (Simulates incoming Twitch Chat message)
+    const testSamples = [
+      { username: '4VREN', text: 'جعفر شوف وش صار', role: 'moderator' },
+      { username: 'solyyy6', text: 'ههههههههه أسطوري يا وحش', role: 'subscriber' },
+      { username: 'user123', text: 'وش تلعب اليوم يا جيف؟', role: 'viewer' },
+      { username: '${broadcaster}', text: 'حياكم الله جميعاً بالبث!', role: 'broadcaster' }
+    ];
+    let sampleIdx = 0;
+    async function sendTestChatMessage() {
+      const key = getStoredKey();
+      const sample = testSamples[sampleIdx % testSamples.length];
+      sampleIdx++;
+      try {
+        await fetch('/api/chat-log/test-message?key=' + encodeURIComponent(key), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(sample),
+        });
+      } catch (err) {
+        console.error('Test message failed:', err);
+      }
+    }
+
+    // Counters & Status Helpers
+    function updateCounter(count) {
+      msgCountDisplay.innerText = count;
+    }
+
+    function updateStreamStatus(isLive) {
+      if (isLive) {
+        streamStatusPill.className = 'status-pill live';
+        streamStatusPill.innerText = '🔴 بث مباشر نشط';
+      } else {
+        streamStatusPill.className = 'status-pill offline';
+        streamStatusPill.innerText = '⚪ البث متوقف';
+      }
+    }
+
+    // Auth Overlay Handlers
+    function showAuthModal() {
+      authOverlay.style.display = 'flex';
+      authKeyInput.value = '';
+      authKeyInput.focus();
+    }
+
+    function hideAuthModal() {
+      authOverlay.style.display = 'none';
+      authErrorMsg.style.display = 'none';
+    }
+
+    async function handleAuthSubmit(e) {
+      e.preventDefault();
+      const enteredKey = authKeyInput.value.trim();
+      if (!enteredKey) return;
+
+      const submitBtn = document.getElementById('btnAuthSubmit');
+      submitBtn.disabled = true;
+      submitBtn.innerText = 'جاري التحقق...';
+
+      try {
+        const res = await fetch('/api/chat-log/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key: enteredKey }),
+        });
+        const data = await res.json();
+        if (data.authorized) {
+          localStorage.setItem('chat_log_key', enteredKey);
+          hideAuthModal();
+          initChatStream();
+        } else {
+          authErrorMsg.style.display = 'block';
+        }
+      } catch (err) {
+        authErrorMsg.style.display = 'block';
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.innerText = 'فتح الشات المباشر';
+      }
+    }
+
+    // Startup
+    initChatStream();
+  </script>
+</body>
+</html>`);
+});
+
+/**
  * Main Twitch Nightbot AI Endpoint
  * GET /api/ai?q=VIEWER_MESSAGE&user=USERNAME
  * Returns plain text ONLY
@@ -3572,6 +4750,28 @@ app.get('/', (req, res) => {
         <div class="status-label">رؤية البث المباشر (Vision)</div>
         <div class="status-value" id="twitchVisionCardStatus" style="font-size: 13px;">كل ${VISION_INTERVAL_SECONDS} ثوانٍ</div>
       </div>
+      <div class="status-card" style="border-color: #DDD6FE; background: #FAF5FF;">
+        <div class="status-label" style="color: #7C3AED;">مراقبة الشات الحي</div>
+        <div class="status-value" style="font-size: 13px;">
+          <a href="/chat-log" target="_blank" style="color: #9146FF; font-weight: 700; text-decoration: none;">فتح /chat-log ↗</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- Twitch Live Chat Log Card -->
+    <div class="card" style="border: 1px solid #DDD6FE; background: #FFFFFF;">
+      <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 8px;">
+        <h2 style="margin-bottom: 0;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="#9146FF"><path d="M11.571 4.714h1.715v5.143H11.57zm4.715 0H18v5.143h-1.714zM6 0L1.714 4.286v15.428h5.143V24l4.286-4.286h3.428L22.286 12V0zm14.571 11.143l-3.428 3.428h-3.429l-3 3v-3H6.857V1.714h13.714z"/></svg>
+          صفحة سجل الشات المباشر (Twitch Chat Log)
+        </h2>
+        <a href="/chat-log" target="_blank" class="btn-primary" style="background: #9146FF; border-color: #9146FF; text-decoration: none; display: inline-flex; align-items: center; gap: 6px;">
+          <span>💬</span> فتح صفحة /chat-log
+        </a>
+      </div>
+      <p class="card-caption">
+        صفحة مستقلة وسريعة تعمل لحظياً (Real-time SSE) لمشاهدة شات القناة المستهدفة (<code style="background: #F3F4F6; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 12px;">@${TWITCH_BROADCASTER_LOGIN || '8jef'}</code>) مباشرة من الجوال أو الكمبيوتر، مع دعم البحث، التمرير التلقائي، الرتب والشارات، وحماية خاصة عبر <code style="background: #F3F4F6; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 11px;">CHAT_LOG_SECRET</code>.
+      </p>
     </div>
 
     <!-- Twitch Stream Vision Card -->
