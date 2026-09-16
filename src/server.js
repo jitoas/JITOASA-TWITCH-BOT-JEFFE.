@@ -1428,6 +1428,13 @@ async function startTwitchChatConnection(customWsUrl = null) {
             isReplyToBot: analysis.isReplyToBot,
           };
 
+          // 3.4. Auto-Mod Check (Repeated insults or provocation towards Jaafar)
+          // Deterministic, 60s timeout on repeated violations, immune accounts protected
+          const autoModHandled = await processAutoModForChatEvent(chatEvent);
+          if (autoModHandled) {
+            return;
+          }
+
           // 3.5. Moderation Commands check (Timeout & Permanent Ban)
           // Commands such as:
           // - !timeout @username 10m [reason]
@@ -2468,6 +2475,148 @@ async function handleBanCommand({ chatEvent, banCmd }) {
   } else {
     await sendTwitchChatMessage(`@${chatterName} ⚠️ ${result.message || 'تعذر تنفيذ الباند.'}`);
   }
+}
+
+/**
+ * ============================================================================
+ * Jaafar Auto-Mod System (Deterministic Rule-Based Moderation)
+ * - Monitors incoming Twitch chat messages for repeated insults or provocation.
+ * - Enforces 60-second Timeout only on clear repeated violations within a window.
+ * - Strictly immune: 8jef (Broadcaster), 4VREN (Jito), and jaafarbot.
+ * - Deduplication & streak cooldown prevents spamming multiple timeouts.
+ * - Completely deterministic without any LLM/Gemini involvement.
+ * ============================================================================
+ */
+
+// Configurable Auto-Mod Parameters
+const AUTO_MOD_WINDOW_MS = 60 * 1000;      // 60 seconds tracking window for repetition
+const AUTO_MOD_THRESHOLD = 2;              // 2 or more detected insults within window triggers timeout
+const AUTO_MOD_TIMEOUT_SECONDS = 60;       // 60-second timeout
+const AUTO_MOD_COOLDOWN_MS = 120 * 1000;   // 2 minutes cooldown to prevent repeated timeouts for the same streak
+
+// In-memory tracker for Auto-Mod violations: Map<chatterLogin, { strikes: number[], lastTimeoutAt: number }>
+const autoModViolations = new Map();
+
+/**
+ * Normalizes text for insult / provocation detection
+ */
+function normalizeTextForAutoMod(str) {
+  if (!str || typeof str !== 'string') return '';
+  return str
+    .toLowerCase()
+    .replace(/[\u064B-\u065F\u0670]/g, '') // remove Arabic diacritics / tashkeel
+    .replace(/ـ+/g, '')                    // remove tatweel
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/ى/g, 'ي')
+    .replace(/ؤ/g, 'و')
+    .replace(/ئ/g, 'ي')
+    .replace(/ة/g, 'ه');
+}
+
+/**
+ * Detects if a chat message contains clear insults, offensive slurs, or toxic provocation
+ * directed at Jaafar / the bot or severe profanity.
+ */
+function isInsultOrProvocation(rawText) {
+  if (!rawText || typeof rawText !== 'string') return false;
+  const t = normalizeTextForAutoMod(rawText);
+
+  // Insults explicitly targeting Jaafar or the bot
+  const targetInsults = [
+    /(جعفر|بوت|jaafar|jaafarbot)\s*(غبي|حمار|كلب|زق|حيوان|فاشل|تافه|حقير|سخيف|معفن|زباله|خايس|سقيم|مريض|انقلع|اسكت|انكتم|انطم|ورع|خرا|قذر|واطي|منحط|اهبل|مغفل|يلعنك|لعنك|قذر)/i,
+    /(يلعن|تف على|تفو على|طز في|كس ام|يلعن شكل|الله يلعن|عنك)\s*(جعفر|البوت|jaafar)/i,
+    /(يا\s*)?(غبي|حمار|كلب|زق|حيوان|فاشل|تافه|حقير|سخيف|معفن|زباله|خايس|سقيم|واطي|خسيس|وقح|نذل|رخمه|منحط|اهبل|مغفل)\s*(يا\s*)?(جعفر|بوت|jaafar)/i,
+  ];
+
+  if (targetInsults.some(regex => regex.test(t))) {
+    return true;
+  }
+
+  // General severe abusive insults & harassment phrases
+  const severeAbusePatterns = [
+    /(?:^|\s)(?:يا\s*)?(?:غبي|حمار|كلب|زق|حيوان|فاشل|تافه|حقير|سخيف|معفن|زباله|خايس|واطي|خسيس|وقح|نذل|رخمه|منحط|سافل|اهبل|مغفل)(?:$|\s|[!?.،,])/i,
+    /(?:انقلع|انطم|انكتم|كل تبن|كل زق|كل خرا|كل خري|ابن الكلب|ابن الحرام|تف عليك|تفو عليك|يلعنك|الله يلعنك|يا ورع|يا قليل الادب|يا قليل الحياء)/i,
+    /\b(fuck\s+(?:you|u|jaafar|bot)?|stfu|shut\s+up\s*(?:jaafar|bot)?|bitch|idiot\s+bot|stupid\s+bot|trash\s+bot|dumb\s+bot|worthless\s+bot|asshole)\b/i,
+  ];
+
+  return severeAbusePatterns.some(regex => regex.test(t));
+}
+
+/**
+ * Evaluates chat event against Auto-Mod rules and executes 60s timeout if repeated threshold met
+ */
+async function processAutoModForChatEvent(chatEvent) {
+  if (!chatEvent) return false;
+
+  const chatterName = chatEvent.chatter_user_name || chatEvent.chatter_user_login || 'المستخدم';
+  const chatterLogin = (chatEvent.chatter_user_login || '').toLowerCase().trim();
+  const chatterId = chatEvent.chatter_user_id ? String(chatEvent.chatter_user_id).trim() : null;
+  const messageText = chatEvent.message?.text || '';
+
+  if (!chatterLogin || !messageText) return false;
+
+  // 1. Absolute Immunity Check: 8jef, 4VREN (Jito), and jaafarbot are never timed out by Auto-Mod
+  const immunity = await checkModerationImmunity({ targetUserId: chatterId, targetUserLogin: chatterLogin });
+  if (immunity && immunity.immune) {
+    return false;
+  }
+
+  // 2. Deterministic insult / provocation detection
+  if (!isInsultOrProvocation(messageText)) {
+    return false;
+  }
+
+  const now = Date.now();
+
+  // 3. Log individual detected insult/warning
+  console.log(`[Auto-Mod] Warning/insult detected: ${chatterName}`);
+
+  // 4. Retrieve or initialize user violation record
+  let record = autoModViolations.get(chatterLogin);
+  if (!record) {
+    record = { strikes: [], lastTimeoutAt: 0 };
+    autoModViolations.set(chatterLogin, record);
+  }
+
+  // 5. Cooldown check: prevent multiple timeouts for the same streak
+  if (record.lastTimeoutAt && (now - record.lastTimeoutAt < AUTO_MOD_COOLDOWN_MS)) {
+    return false;
+  }
+
+  // 6. Filter strikes within sliding window
+  record.strikes = (record.strikes || []).filter(ts => (now - ts) <= AUTO_MOD_WINDOW_MS);
+  record.strikes.push(now);
+
+  // 7. Check if repeated violation threshold reached
+  if (record.strikes.length >= AUTO_MOD_THRESHOLD) {
+    console.log(`[Auto-Mod] Repeated provocation detected: ${chatterName}`);
+    console.log(`[Auto-Mod] Timeout 60s: ${chatterName}`);
+
+    // Update state to prevent duplicate timeouts
+    record.lastTimeoutAt = now;
+    record.strikes = [];
+
+    // Execute 60s timeout using existing timeout engine
+    const botUserId = twitchAuthState.user?.id ? String(twitchAuthState.user.id).trim() : null;
+    try {
+      const timeoutRes = await executeTwitchTimeout({
+        targetUsername: chatterLogin,
+        durationSeconds: AUTO_MOD_TIMEOUT_SECONDS,
+        durationText: `${AUTO_MOD_TIMEOUT_SECONDS}s`,
+        reason: 'Auto-Mod: تكرار السب والاستفزاز في الشات',
+        callerName: 'jaafarbot (Auto-Mod)',
+        callerId: botUserId,
+      });
+
+      if (timeoutRes.success) {
+        return true;
+      }
+    } catch (err) {
+      console.error(`[Auto-Mod] Failed to execute timeout for @${chatterLogin}:`, err?.message || err);
+    }
+  }
+
+  return false;
 }
 
 /**
