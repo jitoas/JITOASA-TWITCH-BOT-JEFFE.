@@ -1377,9 +1377,19 @@ async function startTwitchChatConnection(customWsUrl = null) {
             isReplyToBot: analysis.isReplyToBot,
           };
 
-          // 3.5. Timeout Moderation Command check
-          // Commands such as: @jaafarbot timeout @username 10m [reason]
-          // Processed strictly deterministically without Gemini, with permission checks
+          // 3.5. Moderation Commands check (Timeout & Permanent Ban)
+          // Commands such as:
+          // - !timeout @username 10m [reason]
+          // - !ban @username [reason]
+          // - جعفر باند @username [reason]
+          // - @jaafarbot ban @username [reason]
+          // Processed strictly deterministically without Gemini, with strict User ID permission checks (8jef & 4VREN only)
+          const banCmd = parseBanCommand(messageText, twitchAuthState.user?.login);
+          if (banCmd && banCmd.isCommand) {
+            await handleBanCommand({ chatEvent, banCmd });
+            return;
+          }
+
           const timeoutCmd = parseTimeoutCommand(messageText, twitchAuthState.user?.login);
           if (timeoutCmd && timeoutCmd.isCommand) {
             await handleTimeoutCommand({ chatEvent, timeoutCmd });
@@ -1513,10 +1523,24 @@ async function sendTwitchChatMessage(messageText) {
 
 /**
  * ============================================================================
- * Twitch Moderation & Timeout System
+ * Twitch Moderation: Timeout & Permanent Ban System
  * Official Twitch Helix API: POST https://api.twitch.tv/helix/moderation/bans
- * Scopes: moderator:manage:banned_users
- * Permissions: Broadcaster (8jef) or Moderators only
+ * Scopes: moderator:manage:banned_users (covers both Timeout & Permanent Ban)
+ *
+ * STRICT PERMISSIONS:
+ * Only two accounts are authorized to use Timeout and Ban via Jaafar:
+ *   1. 8jef (Broadcaster)
+ *   2. 4VREN (Jito - Creator & Developer)
+ * Verified via Twitch User IDs (with fallback to verified logins).
+ * No other chatter, Moderator, VIP, or Subscriber has permission.
+ *
+ * ABSOLUTE IMMUNITY:
+ * The following accounts are strictly protected from both Timeout and Ban:
+ *   1. 8jef (Broadcaster)
+ *   2. 4VREN (Jito)
+ *   3. jaafarbot (The Bot itself)
+ * Any attempt is rejected immediately before dispatching any Twitch Helix request.
+ *
  * Deterministic execution: 100% code-based, Gemini does NOT intervene.
  * ============================================================================
  */
@@ -1555,6 +1579,142 @@ function sanitizeLogMessage(text) {
 }
 
 /**
+ * Resolves the Broadcaster Twitch User ID (8jef)
+ */
+async function resolveBroadcasterUserId() {
+  if (twitchChatState.broadcaster?.id) {
+    return String(twitchChatState.broadcaster.id).trim();
+  }
+  const broadcasterLogin = TWITCH_BROADCASTER_LOGIN || '8jef';
+  const info = await fetchTwitchUserInfoByLogin(broadcasterLogin);
+  if (info?.id) {
+    twitchChatState.broadcaster = info;
+    return String(info.id).trim();
+  }
+  return null;
+}
+
+/**
+ * Resolves Jito's Twitch User ID (4VREN)
+ */
+async function resolveJitoUserId() {
+  if (jitoIdentity.userId) {
+    return String(jitoIdentity.userId).trim();
+  }
+  try {
+    const resolved = await resolveJitoTwitchIdentity();
+    if (resolved?.userId) {
+      return String(resolved.userId).trim();
+    }
+  } catch (err) {
+    // ignore
+  }
+  return null;
+}
+
+/**
+ * Verifies if a given chatter is authorized to execute Moderation commands (Timeout or Ban).
+ * STRICTLY restricted to only:
+ *   1. 8jef (Channel Broadcaster)
+ *   2. 4VREN (Jito)
+ * Validated by Twitch User IDs (with verified fallback).
+ * No other Moderator or viewer is authorized.
+ */
+async function isAuthorizedModeratorExecutor(chatEvent) {
+  if (!chatEvent) return false;
+
+  const chatterId = chatEvent.chatter_user_id ? String(chatEvent.chatter_user_id).trim() : null;
+  const chatterLogin = (chatEvent.chatter_user_login || '').toLowerCase().trim();
+
+  // 1. Broadcaster (8jef) User ID check
+  let broadcasterId = twitchChatState.broadcaster?.id ? String(twitchChatState.broadcaster.id).trim() : null;
+  if (!broadcasterId) {
+    broadcasterId = await resolveBroadcasterUserId();
+  }
+
+  if (chatterId && broadcasterId && chatterId === broadcasterId) {
+    return true;
+  }
+
+  const broadcasterLogin = (TWITCH_BROADCASTER_LOGIN || '8jef').toLowerCase().trim();
+  if (chatterLogin === broadcasterLogin || chatterLogin === '8jef') {
+    return true;
+  }
+
+  // 2. Jito (4VREN) User ID check
+  let jitoId = jitoIdentity.userId ? String(jitoIdentity.userId).trim() : null;
+  if (!jitoId) {
+    jitoId = await resolveJitoUserId();
+  }
+
+  if (chatterId && jitoId && chatterId === jitoId) {
+    return true;
+  }
+
+  if (isJitoChatter(chatEvent)) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Checks if target user has absolute immunity from Timeout and Ban.
+ * Protected accounts:
+ *   - 8jef (Broadcaster)
+ *   - 4VREN (Jito)
+ *   - jaafarbot (Bot itself)
+ * Returns { immune: true, reason: '...' } or { immune: false }
+ */
+async function checkModerationImmunity({ targetUserId, targetUserLogin }) {
+  const normalizedLogin = (targetUserLogin || '').toLowerCase().replace(/^@/, '').trim();
+  const normalizedId = targetUserId ? String(targetUserId).trim() : null;
+
+  // 1. Broadcaster (8jef)
+  let broadcasterId = twitchChatState.broadcaster?.id ? String(twitchChatState.broadcaster.id).trim() : null;
+  if (!broadcasterId) {
+    broadcasterId = await resolveBroadcasterUserId();
+  }
+  const broadcasterLogin = (TWITCH_BROADCASTER_LOGIN || '8jef').toLowerCase().trim();
+
+  if ((normalizedId && broadcasterId && normalizedId === broadcasterId) || normalizedLogin === broadcasterLogin || normalizedLogin === '8jef') {
+    return {
+      immune: true,
+      category: 'BROADCASTER',
+      message: 'لا يمكن إعطاء تايم اوت أو باند لصاحب القناة (8jef)!',
+    };
+  }
+
+  // 2. Bot itself (jaafarbot)
+  const botUserId = twitchAuthState.user?.id ? String(twitchAuthState.user.id).trim() : null;
+  const botLogin = (twitchAuthState.user?.login || 'jaafarbot').toLowerCase().trim();
+
+  if ((normalizedId && botUserId && normalizedId === botUserId) || normalizedLogin === botLogin || normalizedLogin === 'jaafarbot') {
+    return {
+      immune: true,
+      category: 'BOT_SELF',
+      message: 'ما أقدر أعطي تايم اوت أو باند لنفسي يا كابتن!',
+    };
+  }
+
+  // 3. Jito (4VREN)
+  let jitoId = jitoIdentity.userId ? String(jitoIdentity.userId).trim() : null;
+  if (!jitoId) {
+    jitoId = await resolveJitoUserId();
+  }
+
+  if ((normalizedId && jitoId && normalizedId === jitoId) || isJitoChatter(normalizedLogin) || isJitoChatter({ userId: normalizedId, userLogin: normalizedLogin })) {
+    return {
+      immune: true,
+      category: 'JITO',
+      message: 'ما أقدر أعطي تايم اوت أو باند لجيتو (4VREN)، هذا صانعي ومطوّري وخط أحمر! 🔥',
+    };
+  }
+
+  return { immune: false };
+}
+
+/**
  * Supported timeout durations mapping to seconds and human-readable Arabic labels
  * Supported units: 10s, 30s, 1m, 5m, 10m, 30m, 1h, 2h, 24h, 1d, 7d
  */
@@ -1587,31 +1747,20 @@ const SUPPORTED_TIMEOUT_DURATIONS = {
 };
 
 /**
- * Checks if the message sender is the broadcaster or has moderator privileges
- * Relies on Twitch User ID and Twitch Moderator badge rather than username strings alone.
+ * Legacy compatibility alias: checks if executor is authorized for moderation
  */
 function isUserModeratorOrBroadcaster(chatEvent) {
-  if (!chatEvent) return false;
-  const chatterLogin = (chatEvent.chatter_user_login || '').toLowerCase().trim();
-  const chatterId = chatEvent.chatter_user_id ? String(chatEvent.chatter_user_id).trim() : null;
+  // Broadcaster check
+  const chatterLogin = (chatEvent?.chatter_user_login || '').toLowerCase().trim();
+  const chatterId = chatEvent?.chatter_user_id ? String(chatEvent.chatter_user_id).trim() : null;
   const broadcasterId = twitchChatState.broadcaster?.id ? String(twitchChatState.broadcaster.id).trim() : null;
   const broadcasterLogin = (TWITCH_BROADCASTER_LOGIN || '8jef').toLowerCase().trim();
 
-  // 1. Broadcaster identity check: User ID first, fallback to login
   if (chatterId && broadcasterId && chatterId === broadcasterId) return true;
   if (chatterLogin && (chatterLogin === broadcasterLogin || chatterLogin === '8jef')) return true;
 
-  // 2. Twitch badges check: [{ set_id: 'broadcaster' }, { set_id: 'moderator' }]
-  // Primary check: Relies on actual Moderator / Broadcaster badge assigned in Twitch channel
-  const badges = Array.isArray(chatEvent.badges) ? chatEvent.badges : [];
-  if (badges.some(b => b.set_id === 'broadcaster' || b.set_id === 'moderator')) {
-    return true;
-  }
-
-  // 3. Jito check: permanent Twitch User ID or recognized identity
-  if (isJitoChatter(chatEvent)) {
-    return true;
-  }
+  // Jito check
+  if (isJitoChatter(chatEvent)) return true;
 
   return false;
 }
@@ -1728,6 +1877,79 @@ function parseTimeoutCommand(rawText, botLogin = 'jaafarbot') {
 }
 
 /**
+ * Parses chat message to detect permanent Ban command
+ * Supported formats:
+ * - !ban @username [reason]
+ * - جعفر باند @username [reason]
+ * - جعفر بان @username [reason]
+ * - @jaafarbot ban @username [reason]
+ * - يا جعفر باند @username [reason]
+ * - !باند @username [reason]
+ * - !بان @username [reason]
+ */
+function parseBanCommand(rawText, botLogin = 'jaafarbot') {
+  if (!rawText || typeof rawText !== 'string') return null;
+  const text = rawText.trim();
+
+  let rest = null;
+
+  // Pattern 1: Command prefix (!ban, !باند, !بان)
+  const prefixMatch = text.match(/^!(?:ban|باند|بان)(?:\s+(.*)|$)/i);
+  if (prefixMatch) {
+    rest = (prefixMatch[1] || '').trim();
+  } else {
+    // Pattern 2: Mention or name followed by ban keyword
+    const botNames = ['jaafarbot', 'jaafar', 'جعفر'];
+    if (botLogin && !botNames.includes(botLogin.toLowerCase())) {
+      botNames.unshift(botLogin.toLowerCase());
+    }
+    const escapedBotNames = botNames.map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+    const mentionRegex = new RegExp(
+      `^(?:@?(?:${escapedBotNames})|يا\\s+جعفر)[,:\\s]+\\s*(?:ban|باند|بان)(?:\\s+(.*)|$)`,
+      'i'
+    );
+    const mentionMatch = text.match(mentionRegex);
+    if (mentionMatch) {
+      rest = (mentionMatch[1] || '').trim();
+    }
+  }
+
+  if (rest === null) {
+    return null; // Not a ban command
+  }
+
+  // If no arguments provided
+  if (!rest) {
+    return {
+      isCommand: true,
+      valid: false,
+      error: 'MISSING_ARGS',
+    };
+  }
+
+  const parts = rest.split(/\s+/);
+  const targetUserRaw = parts[0];
+  const targetUser = targetUserRaw.replace(/^@+/, '').replace(/[,:]$/, '').trim();
+
+  if (!targetUser) {
+    return {
+      isCommand: true,
+      valid: false,
+      error: 'MISSING_TARGET',
+    };
+  }
+
+  const reason = parts.slice(1).join(' ').trim() || null;
+
+  return {
+    isCommand: true,
+    valid: true,
+    targetUser,
+    reason,
+  };
+}
+
+/**
  * Executes Timeout via official Twitch Helix API
  * POST https://api.twitch.tv/helix/moderation/bans?broadcaster_id={broadcaster_id}&moderator_id={moderator_id}
  * Body: { data: { user_id: "{target_user_id}", duration: {durationSeconds}, reason: "{reason}" } }
@@ -1744,7 +1966,7 @@ async function executeTwitchTimeout({ targetUsername, durationSeconds, durationT
     return { success: false, error: 'NO_TOKEN', message: 'توكن تويتش غير متوفر أو منتهي الصلاحية. يرجى زيارة /auth/twitch.' };
   }
 
-  // 2. Check OAuth Scope
+  // 2. Check OAuth Scope (moderator:manage:banned_users)
   if (!hasModeratorManageBannedUsersScope()) {
     const activeScopes = (Array.isArray(twitchAuthState.scopes) ? twitchAuthState.scopes : []).join(' ');
     console.error('[Twitch Moderation] ========================================');
@@ -1761,14 +1983,7 @@ async function executeTwitchTimeout({ targetUsername, durationSeconds, durationT
   }
 
   // 3. Resolve Broadcaster User ID (8jef)
-  let broadcasterId = twitchChatState.broadcaster?.id ? String(twitchChatState.broadcaster.id).trim() : null;
-  if (!broadcasterId) {
-    const broadcasterInfo = await fetchTwitchUserInfoByLogin(TWITCH_BROADCASTER_LOGIN || '8jef');
-    if (broadcasterInfo?.id) {
-      twitchChatState.broadcaster = broadcasterInfo;
-      broadcasterId = String(broadcasterInfo.id).trim();
-    }
-  }
+  let broadcasterId = await resolveBroadcasterUserId();
   if (!broadcasterId) {
     console.error('[Twitch Moderation] ERROR CATEGORY: [Broadcaster ID Unresolved]');
     console.error(`[Twitch Moderation] Failed to resolve Twitch User ID for broadcaster "${TWITCH_BROADCASTER_LOGIN || '8jef'}".`);
@@ -1801,21 +2016,12 @@ async function executeTwitchTimeout({ targetUsername, durationSeconds, durationT
 
   const targetUserId = String(targetUser.id).trim();
   const targetUserLogin = (targetUser.login || targetUsername).toLowerCase();
-  const broadcasterLogin = (TWITCH_BROADCASTER_LOGIN || '8jef').toLowerCase();
-  const botLogin = (twitchAuthState.user?.login || 'jaafarbot').toLowerCase();
 
-  // 6. Protection: Prevent timing out broadcaster, the bot itself, or Jito
-  if (targetUserId === broadcasterId || targetUserLogin === broadcasterLogin || targetUserLogin === '8jef') {
-    console.warn(`[Twitch Moderation] Blocked: Timeout attempted on broadcaster @${targetUser.login} (ID: ${targetUserId}) by @${callerName}`);
-    return { success: false, error: 'CANNOT_TIMEOUT_BROADCASTER', message: 'لا يمكن إعطاء تايم اوت لصاحب القناة!' };
-  }
-  if (targetUserId === botUserId || targetUserLogin === botLogin) {
-    console.warn(`[Twitch Moderation] Blocked: Timeout attempted on bot itself @${targetUser.login} (ID: ${targetUserId}) by @${callerName}`);
-    return { success: false, error: 'CANNOT_TIMEOUT_BOT', message: 'ما أقدر أعطي تايم اوت لنفسي يا كابتن!' };
-  }
-  if (isJitoChatter({ userId: targetUser.id, userLogin: targetUser.login })) {
-    console.warn(`[Twitch Moderation] Blocked: Timeout attempted on Jito @${targetUser.login} (ID: ${targetUserId}) by @${callerName}`);
-    return { success: false, error: 'CANNOT_TIMEOUT_JITO', message: 'ما أقدر أعطي تايم اوت لجيتو، هذا اللي صانعني ومطورني! 🔥' };
+  // 6. Absolute Immunity Check: 8jef, 4VREN, jaafarbot
+  const immunity = await checkModerationImmunity({ targetUserId, targetUserLogin });
+  if (immunity.immune) {
+    console.warn(`[Twitch Moderation] Blocked by Absolute Immunity: Timeout attempted on protected account @${targetUser.login} (ID: ${targetUserId}) [${immunity.category}] by @${callerName}`);
+    return { success: false, error: `CANNOT_TIMEOUT_${immunity.category}`, message: immunity.message };
   }
 
   // 7. Call Official Twitch Helix Ban/Timeout API
@@ -1914,22 +2120,192 @@ async function executeTwitchTimeout({ targetUsername, durationSeconds, durationT
 }
 
 /**
- * Handles incoming timeout command deterministically with permission checks
+ * Executes Permanent Ban via official Twitch Helix API
+ * POST https://api.twitch.tv/helix/moderation/bans?broadcaster_id={broadcaster_id}&moderator_id={moderator_id}
+ * Body: { data: { user_id: "{target_user_id}", reason: "{reason}" } }
+ * Note: Omission of 'duration' parameter creates a permanent ban per Twitch Helix API specification.
+ */
+async function executeTwitchPermanentBan({ targetUsername, reason, callerName, callerId }) {
+  // 1. Check Token
+  const token = await refreshTwitchTokenIfNeeded();
+  if (!token) {
+    console.error('[Twitch Moderation] ========================================');
+    console.error('[Twitch Moderation] ERROR CATEGORY: [Token Expired / Missing]');
+    console.error('[Twitch Moderation] Twitch access token is missing or could not be refreshed.');
+    console.error('[Twitch Moderation] Action Required: Visit /auth/twitch to re-authenticate.');
+    console.error('[Twitch Moderation] ========================================');
+    return { success: false, error: 'NO_TOKEN', message: 'توكن تويتش غير متوفر أو منتهي الصلاحية. يرجى زيارة /auth/twitch.' };
+  }
+
+  // 2. Check OAuth Scope (moderator:manage:banned_users)
+  if (!hasModeratorManageBannedUsersScope()) {
+    const activeScopes = (Array.isArray(twitchAuthState.scopes) ? twitchAuthState.scopes : []).join(' ');
+    console.error('[Twitch Moderation] ========================================');
+    console.error('[Twitch Moderation] ERROR CATEGORY: [OAuth Scope Missing]');
+    console.error(`[Twitch Moderation] Bot token is missing required scope: "moderator:manage:banned_users"`);
+    console.error(`[Twitch Moderation] Active scopes on current token: [${activeScopes}]`);
+    console.error('[Twitch Moderation] Action Required: The bot must be re-authorized via /auth/twitch to grant this scope.');
+    console.error('[Twitch Moderation] ========================================');
+    return {
+      success: false,
+      error: 'MISSING_SCOPE',
+      message: 'رمز تفويض البوت ينقصه تصريح (moderator:manage:banned_users). يرجى فتح /auth/twitch لإعادة التفويض.',
+    };
+  }
+
+  // 3. Resolve Broadcaster User ID (8jef)
+  let broadcasterId = await resolveBroadcasterUserId();
+  if (!broadcasterId) {
+    console.error('[Twitch Moderation] ERROR CATEGORY: [Broadcaster ID Unresolved]');
+    console.error(`[Twitch Moderation] Failed to resolve Twitch User ID for broadcaster "${TWITCH_BROADCASTER_LOGIN || '8jef'}".`);
+    return { success: false, error: 'NO_BROADCASTER', message: 'معرف قناة البث غير متوفر حالياً.' };
+  }
+
+  // 4. Resolve Bot Moderator User ID (jaafarbot)
+  let botUserId = twitchAuthState.user?.id ? String(twitchAuthState.user.id).trim() : null;
+  if (!botUserId) {
+    const botProfile = await ensureTwitchUserProfile();
+    if (botProfile?.id) {
+      botUserId = String(botProfile.id).trim();
+    }
+  }
+  if (!botUserId) {
+    console.error('[Twitch Moderation] ERROR CATEGORY: [Bot User ID Unresolved]');
+    console.error('[Twitch Moderation] Failed to resolve Twitch User ID for bot account.');
+    return { success: false, error: 'NO_BOT_ID', message: 'معرف حساب البوت غير متوفر.' };
+  }
+
+  // 5. Resolve Target User Details from Twitch Helix Users API
+  const targetUser = await fetchTwitchUserInfoByLogin(targetUsername);
+  if (!targetUser || !targetUser.id) {
+    console.warn('[Twitch Moderation] ========================================');
+    console.warn('[Twitch Moderation] ERROR CATEGORY: [User ID / User Not Found]');
+    console.warn(`[Twitch Moderation] Target username "${targetUsername}" does not exist on Twitch.`);
+    console.warn('[Twitch Moderation] ========================================');
+    return { success: false, error: 'USER_NOT_FOUND', message: `لم يتم العثور على المستخدم @${targetUsername} في تويتش.` };
+  }
+
+  const targetUserId = String(targetUser.id).trim();
+  const targetUserLogin = (targetUser.login || targetUsername).toLowerCase();
+
+  // 6. Absolute Immunity Check: 8jef, 4VREN, jaafarbot
+  const immunity = await checkModerationImmunity({ targetUserId, targetUserLogin });
+  if (immunity.immune) {
+    console.warn(`[Twitch Moderation] Blocked by Absolute Immunity: Ban attempted on protected account @${targetUser.login} (ID: ${targetUserId}) [${immunity.category}] by @${callerName}`);
+    return { success: false, error: `CANNOT_BAN_${immunity.category}`, message: immunity.message };
+  }
+
+  // 7. Call Official Twitch Helix Ban API (Permanent Ban - no duration field)
+  // POST https://api.twitch.tv/helix/moderation/bans?broadcaster_id={broadcaster_id}&moderator_id={moderator_id}
+  try {
+    const url = `https://api.twitch.tv/helix/moderation/bans?broadcaster_id=${encodeURIComponent(broadcasterId)}&moderator_id=${encodeURIComponent(botUserId)}`;
+    const reasonText = reason ? `${reason} (باند دائم بواسطة @${callerName})` : `باند دائم بواسطة @${callerName} عبر جعفر`;
+
+    console.log('[Twitch Moderation] ========================================');
+    console.log('[Twitch Moderation] Executing Helix Permanent Ban Request:');
+    console.log(`[Twitch Moderation] - Broadcaster ID: ${broadcasterId} (#${TWITCH_BROADCASTER_LOGIN || '8jef'})`);
+    console.log(`[Twitch Moderation] - Moderator Bot ID: ${botUserId} (@${twitchAuthState.user?.login || 'jaafarbot'})`);
+    console.log(`[Twitch Moderation] - Target User ID: ${targetUserId} (@${targetUser.login})`);
+    console.log(`[Twitch Moderation] - Ban Type: PERMANENT BAN (no duration parameter)`);
+    console.log(`[Twitch Moderation] - Requested by: @${callerName}${callerId ? ` (ID: ${callerId})` : ''}`);
+    console.log('[Twitch Moderation] ========================================');
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Client-Id': TWITCH_CLIENT_ID,
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        data: {
+          user_id: targetUserId,
+          reason: reasonText.slice(0, 500),
+        },
+      }),
+    });
+
+    if (res.status === 200 || res.status === 204) {
+      console.log('[Twitch Moderation] ========================================');
+      console.log(`[Twitch Moderation] ✅ PERMANENT BAN SUCCESSFUL: @${targetUser.login} by @${callerName}`);
+      console.log('[Twitch Moderation] ========================================');
+      return {
+        success: true,
+        targetDisplayName: targetUser.displayName || targetUser.login,
+      };
+    }
+
+    const rawErrBody = await res.text();
+    const errBody = sanitizeLogMessage(rawErrBody);
+
+    console.error('[Twitch Moderation] ========================================');
+    console.error(`[Twitch Moderation] ❌ Ban API Rejected (HTTP ${res.status}): ${errBody}`);
+
+    let friendlyError = 'فشل تنفيذ الباند بسبب خطأ في تويتش.';
+
+    if (res.status === 403) {
+      if (errBody.includes('not one of the broadcaster\'s moderators') || errBody.includes('not a moderator')) {
+        console.error('[Twitch Moderation] ERROR CATEGORY: [Moderator Permissions Missing]');
+        console.error(`[Twitch Moderation] Bot @${twitchAuthState.user?.login || 'jaafarbot'} (ID: ${botUserId}) is NOT a Moderator in #${TWITCH_BROADCASTER_LOGIN || '8jef'} (ID: ${broadcasterId})!`);
+        console.error(`[Twitch Moderation] ACTION REQUIRED: In Twitch chat #${TWITCH_BROADCASTER_LOGIN || '8jef'}, run: /mod ${twitchAuthState.user?.login || 'jaafarbot'}`);
+        friendlyError = `جعفر يحتاج صلاحية مشرف (Mod) في القناة. اكتب في الشات: /mod ${twitchAuthState.user?.login || 'jaafarbot'}`;
+      } else if (errBody.includes('cannot be banned')) {
+        console.error('[Twitch Moderation] ERROR CATEGORY: [Target User Protected / Is Moderator]');
+        console.error(`[Twitch Moderation] Target user @${targetUser.login} cannot be banned (user may be a channel Moderator).`);
+        friendlyError = 'لا يمكن حظر هذا المستخدم (قد يكون مشرفاً في القناة أو حسابه محمي).';
+      } else if (errBody.includes('scope') || errBody.includes('moderator:manage:banned_users')) {
+        console.error('[Twitch Moderation] ERROR CATEGORY: [OAuth Scope Missing]');
+        console.error('[Twitch Moderation] Token is missing scope moderator:manage:banned_users. Re-authorization required.');
+        friendlyError = 'رمز التفويض ينقصه تصريح (moderator:manage:banned_users). يرجى زيارة /auth/twitch لتحديث الصلاحيات.';
+      } else {
+        console.error('[Twitch Moderation] ERROR CATEGORY: [Forbidden 403]');
+        friendlyError = 'لا يمكن حظر هذا المستخدم (تأكد من صلاحيات المشرفين في القناة).';
+      }
+    } else if (res.status === 401) {
+      console.error('[Twitch Moderation] ERROR CATEGORY: [Token Expired / Invalid]');
+      console.error('[Twitch Moderation] Twitch returned 401 Unauthorized. Token refresh failed or permissions revoked.');
+      friendlyError = 'انتهت صلاحية الجلسة، يرجى إعادة توثيق البوت عبر /auth/twitch.';
+    } else if (res.status === 400) {
+      console.error('[Twitch Moderation] ERROR CATEGORY: [Twitch API Bad Request]');
+      console.error(`[Twitch Moderation] HTTP 400: ${errBody}`);
+      friendlyError = 'طلب الباند غير صالح أو تم رفضه من تويتش.';
+    } else if (res.status === 429) {
+      console.error('[Twitch Moderation] ERROR CATEGORY: [Twitch API Rate Limit]');
+      friendlyError = 'تم تجاوز معدل الطلبات المسموح به في تويتش، يرجى الانتظار قليلاً.';
+    } else {
+      console.error(`[Twitch Moderation] ERROR CATEGORY: [Twitch API HTTP ${res.status}]`);
+    }
+    console.error('[Twitch Moderation] ========================================');
+
+    return { success: false, status: res.status, error: errBody, message: friendlyError };
+  } catch (err) {
+    const safeError = sanitizeLogMessage(err?.message || err);
+    console.error('[Twitch Moderation] ========================================');
+    console.error('[Twitch Moderation] ERROR CATEGORY: [Network / Unexpected Error]');
+    console.error('[Twitch Moderation] Error executing ban:', safeError);
+    console.error('[Twitch Moderation] ========================================');
+    return { success: false, error: safeError, message: 'حدث خطأ في الاتصال أثناء تنفيذ الباند.' };
+  }
+}
+
+/**
+ * Handles incoming timeout command deterministically with strict permission checks
+ * Allowed ONLY for: 8jef (Broadcaster) & 4VREN (Jito) via User IDs
  */
 async function handleTimeoutCommand({ chatEvent, timeoutCmd }) {
   const chatterName = chatEvent.chatter_user_name || chatEvent.chatter_user_login || 'المستخدم';
   const chatterLogin = (chatEvent.chatter_user_login || '').toLowerCase();
   const chatterId = chatEvent.chatter_user_id ? String(chatEvent.chatter_user_id).trim() : null;
 
-  // 1. Permission Check: Broadcaster or Moderator only
-  const isAuthorized = isUserModeratorOrBroadcaster(chatEvent);
+  // 1. Strict Permission Check: 8jef and 4VREN only
+  const isAuthorized = await isAuthorizedModeratorExecutor(chatEvent);
   if (!isAuthorized) {
     console.warn('[Twitch Moderation] ========================================');
     console.warn('[Twitch Moderation] ERROR CATEGORY: [Unauthorized Executor]');
-    console.warn(`[Twitch Moderation] Unauthorized timeout attempt by regular chatter @${chatterLogin}${chatterId ? ` (ID: ${chatterId})` : ''}`);
-    console.warn(`[Twitch Moderation] Chatter badges: ${JSON.stringify(chatEvent.badges || [])}`);
+    console.warn(`[Twitch Moderation] Unauthorized timeout attempt by chatter @${chatterLogin}${chatterId ? ` (ID: ${chatterId})` : ''}`);
+    console.warn(`[Twitch Moderation] Permissions are strictly restricted to 8jef and 4VREN.`);
     console.warn('[Twitch Moderation] ========================================');
-    await sendTwitchChatMessage(`@${chatterName} عذراً، أمر التايم اوت متاح فقط لصاحب البث (8jef) والمشرفين (Mods).`);
+    await sendTwitchChatMessage(`@${chatterName} عذراً، أمر التايم اوت متاح حصرياً لصاحب البث (8jef) وجيتو (4VREN).`);
     return;
   }
 
@@ -1968,9 +2344,61 @@ async function handleTimeoutCommand({ chatEvent, timeoutCmd }) {
 
   if (result.success) {
     const reasonMsg = timeoutCmd.reason ? ` (السبب: ${timeoutCmd.reason})` : '';
-    await sendTwitchChatMessage(`🚫 تم إعطاء تايم اوت للمستخدم @${result.targetDisplayName} لمدة ${result.durationText}${reasonMsg} بواسطة المشرف @${chatterName}.`);
+    await sendTwitchChatMessage(`🚫 تم إعطاء تايم اوت للمستخدم @${result.targetDisplayName} لمدة ${result.durationText}${reasonMsg} بواسطة @${chatterName}.`);
   } else {
     await sendTwitchChatMessage(`@${chatterName} ⚠️ ${result.message || 'تعذر تنفيذ التايم اوت.'}`);
+  }
+}
+
+/**
+ * Handles incoming permanent Ban command deterministically with strict permission checks
+ * Allowed ONLY for: 8jef (Broadcaster) & 4VREN (Jito) via User IDs
+ */
+async function handleBanCommand({ chatEvent, banCmd }) {
+  const chatterName = chatEvent.chatter_user_name || chatEvent.chatter_user_login || 'المستخدم';
+  const chatterLogin = (chatEvent.chatter_user_login || '').toLowerCase();
+  const chatterId = chatEvent.chatter_user_id ? String(chatEvent.chatter_user_id).trim() : null;
+
+  // 1. Strict Permission Check: 8jef and 4VREN only
+  const isAuthorized = await isAuthorizedModeratorExecutor(chatEvent);
+  if (!isAuthorized) {
+    console.warn('[Twitch Moderation] ========================================');
+    console.warn('[Twitch Moderation] ERROR CATEGORY: [Unauthorized Executor]');
+    console.warn(`[Twitch Moderation] Unauthorized ban attempt by chatter @${chatterLogin}${chatterId ? ` (ID: ${chatterId})` : ''}`);
+    console.warn(`[Twitch Moderation] Permissions are strictly restricted to 8jef and 4VREN.`);
+    console.warn('[Twitch Moderation] ========================================');
+    await sendTwitchChatMessage(`@${chatterName} عذراً، أمر الباند متاح حصرياً لصاحب البث (8jef) وجيتو (4VREN).`);
+    return;
+  }
+
+  // 2. Syntax & Argument Validation Check
+  if (!banCmd.valid) {
+    console.warn('[Twitch Moderation] ========================================');
+    console.warn('[Twitch Moderation] ERROR CATEGORY: [Command Syntax]');
+    console.warn(`[Twitch Moderation] Ban command from @${chatterLogin} rejected due to: ${banCmd.error}`);
+    console.warn('[Twitch Moderation] ========================================');
+
+    if (banCmd.error === 'MISSING_TARGET' || banCmd.error === 'MISSING_ARGS') {
+      await sendTwitchChatMessage(`@${chatterName} يرجى تحديد اسم المستخدم المطلوب حظره. الاستخدام: !ban @username [السبب]`);
+      return;
+    }
+    return;
+  }
+
+  // 3. Execute Permanent Ban via Twitch Helix API
+  console.log(`[Twitch Moderation] Authorized executor @${chatterLogin} (ID: ${chatterId || 'unknown'}) requested permanent ban for @${banCmd.targetUser}`);
+  const result = await executeTwitchPermanentBan({
+    targetUsername: banCmd.targetUser,
+    reason: banCmd.reason,
+    callerName: chatterName,
+    callerId: chatterId,
+  });
+
+  if (result.success) {
+    const reasonMsg = banCmd.reason ? ` (السبب: ${banCmd.reason})` : '';
+    await sendTwitchChatMessage(`⛔ تم حظر المستخدم @${result.targetDisplayName} نهائياً (Permanent Ban)${reasonMsg} بواسطة @${chatterName}.`);
+  } else {
+    await sendTwitchChatMessage(`@${chatterName} ⚠️ ${result.message || 'تعذر تنفيذ الباند.'}`);
   }
 }
 
@@ -4603,21 +5031,28 @@ app.get('/api/twitch/chat/status', (req, res) => {
 
 /**
  * GET /api/twitch/moderation/status
- * Diagnostic endpoint for Twitch Moderation and Timeout capabilities
+ * Diagnostic endpoint for Twitch Moderation (Timeout and Permanent Ban) capabilities
  */
-app.get('/api/twitch/moderation/status', (req, res) => {
-  const hasTimeoutScope = hasModeratorManageBannedUsersScope();
-  const broadcasterId = twitchChatState.broadcaster?.id || null;
+app.get('/api/twitch/moderation/status', async (req, res) => {
+  const hasModerationScope = hasModeratorManageBannedUsersScope();
+  const broadcasterId = await resolveBroadcasterUserId();
   const botUserId = twitchAuthState.user?.id || null;
+  const jitoId = await resolveJitoUserId();
 
   return res.status(200).json({
     status: 'ok',
-    ready: Boolean(twitchAuthState.authorized && hasTimeoutScope && broadcasterId && botUserId),
+    ready: Boolean(twitchAuthState.authorized && hasModerationScope && broadcasterId && botUserId),
     helixEndpoint: 'POST https://api.twitch.tv/helix/moderation/bans',
     broadcaster: {
       login: TWITCH_BROADCASTER_LOGIN || '8jef',
       id: broadcasterId,
       resolved: Boolean(broadcasterId),
+    },
+    jito: {
+      currentLogin: jitoIdentity.login || '4vren',
+      id: jitoId,
+      resolved: Boolean(jitoId),
+      knownLogins: Array.from(jitoIdentity.knownLogins),
     },
     botUser: {
       login: twitchAuthState.user?.login || 'jaafarbot',
@@ -4626,76 +5061,114 @@ app.get('/api/twitch/moderation/status', (req, res) => {
       isAuthorized: twitchAuthState.authorized,
     },
     oauth: {
-      hasTimeoutScope,
+      hasModerationScope,
       requiredScope: 'moderator:manage:banned_users',
       scopes: twitchAuthState.scopes,
-      notice: hasTimeoutScope
-        ? 'تصريح التايم اوت (moderator:manage:banned_users) مفعّل ومتوفر في التوكن.'
+      notice: hasModerationScope
+        ? 'تصريح الإشراف (moderator:manage:banned_users) مفعّل ومتوفر في التوكن (يشمل التايم اوت والباند الدائم).'
         : 'تنبيه: التوكن الحالي لا يحتوي على تصريح (moderator:manage:banned_users). يرجى التوجه إلى /auth/twitch لإعادة التفويض.',
     },
     botModeratorRequirement: {
       hint: `يجب أن يمتلك حساب البوت رتبة مشرف (Mod) في قناة #${TWITCH_BROADCASTER_LOGIN || '8jef'}.`,
       command: `/mod ${twitchAuthState.user?.login || 'jaafarbot'}`,
     },
-    supportedCommands: [
-      '@jaafarbot timeout @username 10m [reason]',
-      '!timeout @username 10m [reason]',
-      'جعفر تايم اوت @username 10m [reason]',
-      '!to @username 10m [reason]',
-    ],
-    supportedDurations: [
+    supportedCommands: {
+      timeout: [
+        '@jaafarbot timeout @username 10m [reason]',
+        '!timeout @username 10m [reason]',
+        '!to @username 10m [reason]',
+        'جعفر تايم اوت @username 10m [reason]',
+      ],
+      ban: [
+        '!ban @username [reason]',
+        'جعفر باند @username [reason]',
+        'جعفر بان @username [reason]',
+        '@jaafarbot ban @username [reason]',
+        'يا جعفر باند @username [reason]',
+        '!باند @username [reason]',
+      ],
+    },
+    supportedTimeoutDurations: [
       '10s', '30s', '1m', '5m', '10m', '30m', '1h', '2h', '24h', '1d', '7d'
     ],
     permissions: {
-      broadcaster: 'مسموح لصاحب القناة (8jef)',
-      moderators: 'مسموح لأي مشرف حقيقي (Mod) في القناة',
-      jito: 'حساب 4VREN معرف كـ جيتو ومحمي/مسموح له',
-      regularChatters: 'غير مسموح للمشاهدين العاديين',
+      broadcaster: 'مسموح لصاحب القناة (8jef) - مفحوص بـ Twitch User ID',
+      jito: 'مسموح لـ 4VREN (جيتو) - مفحوص بـ Twitch User ID',
+      moderators: 'ممنوع لجميع المشرفين الآخرين (التحكم حصري لـ 8jef و 4VREN فقط)',
+      vipsAndSubs: 'ممنوع للـ VIPs والمشتركين والجمهور',
     },
-    protections: [
-      'لا يمكن إعطاء تايم اوت لصاحب القناة (8jef)',
-      'لا يمكن للبوت إعطاء تايم اوت لنفسه (jaafarbot)',
-      'لا يمكن إعطاء تايم اوت لجيتو (4VREN)',
-      'المدة إلزامية وغير اختيارية',
-      'معالجة كودية حتمية 100% دون أي تدخل من Gemini',
+    absoluteImmunity: [
+      '8jef (صاحب القناة) - محصن كلياً من التايم اوت والباند',
+      '4VREN (جيتو) - محصن كلياً من التايم اوت والباند',
+      'jaafarbot (البوت نفسه) - محصن كلياً من استهداف نفسه',
+      'يتم فحص الحصانة قبل إرسال أي طلب إلى Twitch Helix',
     ],
+    deterministicExecution: 'معالجة كودية حتمية 100% دون أي تدخل من Gemini',
   });
 });
 
 /**
  * POST /api/twitch/moderation/simulate-command
- * Allows testing command parser, syntax validation, and permission logic
+ * Allows testing command parser, syntax validation, and strict permission logic
  */
-app.post('/api/twitch/moderation/simulate-command', (req, res) => {
-  const { message, callerLogin, isMod, isBroadcaster } = req.body || {};
+app.post('/api/twitch/moderation/simulate-command', async (req, res) => {
+  const { message, callerLogin, callerId } = req.body || {};
   if (!message) {
     return res.status(400).json({ error: 'حقل message إلزامي في جسم الطلب' });
   }
 
+  const banCmd = parseBanCommand(message, twitchAuthState.user?.login || 'jaafarbot');
   const timeoutCmd = parseTimeoutCommand(message, twitchAuthState.user?.login || 'jaafarbot');
-  if (!timeoutCmd || !timeoutCmd.isCommand) {
+
+  const mockChatEvent = {
+    chatter_user_login: callerLogin || 'test_user',
+    chatter_user_name: callerLogin || 'test_user',
+    chatter_user_id: callerId || null,
+  };
+
+  const isAuthorized = await isAuthorizedModeratorExecutor(mockChatEvent);
+
+  if (banCmd && banCmd.isCommand) {
+    const immunity = banCmd.valid
+      ? await checkModerationImmunity({ targetUserLogin: banCmd.targetUser })
+      : null;
+
     return res.status(200).json({
-      isTimeoutCommand: false,
-      message: 'الرسالة ليست أمر تايم اوت',
+      type: 'BAN',
+      isCommand: true,
+      parsed: banCmd,
+      caller: {
+        login: callerLogin || 'test_user',
+        id: callerId || null,
+        isAuthorized,
+      },
+      targetImmunity: immunity,
+      readyForExecution: isAuthorized && banCmd.valid && (!immunity || !immunity.immune),
     });
   }
 
-  const mockChatEvent = {
-    chatter_user_login: callerLogin || 'test_moderator',
-    chatter_user_name: callerLogin || 'test_moderator',
-    badges: isBroadcaster ? [{ set_id: 'broadcaster' }] : (isMod ? [{ set_id: 'moderator' }] : []),
-  };
+  if (timeoutCmd && timeoutCmd.isCommand) {
+    const immunity = timeoutCmd.valid
+      ? await checkModerationImmunity({ targetUserLogin: timeoutCmd.targetUser })
+      : null;
 
-  const isAuthorized = isUserModeratorOrBroadcaster(mockChatEvent);
+    return res.status(200).json({
+      type: 'TIMEOUT',
+      isCommand: true,
+      parsed: timeoutCmd,
+      caller: {
+        login: callerLogin || 'test_user',
+        id: callerId || null,
+        isAuthorized,
+      },
+      targetImmunity: immunity,
+      readyForExecution: isAuthorized && timeoutCmd.valid && (!immunity || !immunity.immune),
+    });
+  }
 
   return res.status(200).json({
-    isTimeoutCommand: true,
-    parsed: timeoutCmd,
-    caller: {
-      login: callerLogin || 'test_moderator',
-      isAuthorized,
-    },
-    readyForExecution: isAuthorized && timeoutCmd.valid,
+    isCommand: false,
+    message: 'الرسالة ليست أمر تايم اوت أو باند',
   });
 });
 
@@ -5147,29 +5620,46 @@ app.get('/', (req, res) => {
       </div>
     </div>
 
-    <!-- Twitch Moderation & Timeout Card -->
+    <!-- Twitch Moderation: Timeout & Permanent Ban Card -->
     <div class="card" style="border: 1px solid #FCA5A5; background: #FFFFFF;">
       <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 8px;">
         <h2 style="margin-bottom: 0; color: #991B1B;">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#DC2626" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"></line></svg>
-          نظام التايم اوت والإشراف الرسمي (Twitch Helix Timeout)
+          نظام الإشراف والتايم اوت والباند الرسمي (Twitch Helix Timeout & Ban)
         </h2>
         <span id="moderationBadge" style="background: #FEF2F2; color: #991B1B; border: 1px solid #FECACA; padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600;">جاري فحص الصلاحيات...</span>
       </div>
       <p class="card-caption">
-        يعمل بأمر تويتش المباشر عبر <strong>Twitch Helix API</strong> الرسمي (<code style="background: #F3F4F6; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 11px;">POST /helix/moderation/bans</code>) بصلاحية <code style="background: #F3F4F6; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 11px;">moderator:manage:banned_users</code> وبشكل برمجي حتمي 100% دون تدخل Gemini.
+        يعمل بأمر تويتش المباشر عبر <strong>Twitch Helix API</strong> الرسمي (<code style="background: #F3F4F6; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 11px;">POST /helix/moderation/bans</code>) بتصريح <code style="background: #F3F4F6; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 11px;">moderator:manage:banned_users</code> وبشكل برمجي حتمي 100% دون تدخل Gemini.
       </p>
 
       <div style="background: #FFF5F5; border: 1px solid #FED7D7; border-radius: 8px; padding: 14px 18px; margin-bottom: 14px;">
-        <div style="font-size: 13px; font-weight: 700; color: #9B2C2C; margin-bottom: 8px;">الأوامر المدعومة في شات البث (للمشرفين وصاحب القناة فقط):</div>
-        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px; margin-bottom: 10px;">
-          <div style="background: white; border: 1px solid #FEB2B2; padding: 8px 12px; border-radius: 6px; font-family: monospace; font-size: 12px; color: #742A2A; direction: ltr; text-align: left;">@jaafarbot timeout @username 10m</div>
-          <div style="background: white; border: 1px solid #FEB2B2; padding: 8px 12px; border-radius: 6px; font-family: monospace; font-size: 12px; color: #742A2A; direction: ltr; text-align: left;">!timeout @username 10m</div>
-          <div style="background: white; border: 1px solid #FEB2B2; padding: 8px 12px; border-radius: 6px; font-family: monospace; font-size: 12px; color: #742A2A; direction: ltr; text-align: left;">!to @username 10m</div>
-          <div style="background: white; border: 1px solid #FEB2B2; padding: 8px 12px; border-radius: 6px; font-family: monospace; font-size: 12px; color: #742A2A; direction: rtl; text-align: right;">جعفر تايم اوت @username 10m</div>
+        <div style="font-size: 13px; font-weight: 700; color: #9B2C2C; margin-bottom: 8px;">
+          🔒 الصلاحيات محصورة حصرياً في حسابين بـ Twitch User IDs:
+          <span style="background: white; padding: 2px 8px; border-radius: 4px; border: 1px solid #FEB2B2; margin-right: 6px;">8jef (صاحب القناة)</span>
+          <span style="background: white; padding: 2px 8px; border-radius: 4px; border: 1px solid #FEB2B2;">4VREN (جيتو)</span>
+        </div>
+        <div style="font-size: 12px; color: #742A2A; margin-bottom: 10px;">
+          🛡️ <strong>الحصانة المطلقة:</strong> يمنع منعاً باتاً إعطاء تايم اوت أو باند للحسابات: <strong>8jef</strong>، <strong>4VREN</strong>، أو <strong>jaafarbot</strong>.
+        </div>
+
+        <div style="font-size: 12px; font-weight: 700; color: #742A2A; margin-bottom: 6px;">أوامر الباند الدائم (Permanent Ban):</div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; margin-bottom: 12px;">
+          <div style="background: white; border: 1px solid #FEB2B2; padding: 6px 10px; border-radius: 6px; font-family: monospace; font-size: 12px; color: #742A2A; direction: ltr; text-align: left;">!ban @username [reason]</div>
+          <div style="background: white; border: 1px solid #FEB2B2; padding: 6px 10px; border-radius: 6px; font-family: monospace; font-size: 12px; color: #742A2A; direction: rtl; text-align: right;">جعفر باند @username [سبب]</div>
+          <div style="background: white; border: 1px solid #FEB2B2; padding: 6px 10px; border-radius: 6px; font-family: monospace; font-size: 12px; color: #742A2A; direction: ltr; text-align: left;">@jaafarbot ban @username</div>
+          <div style="background: white; border: 1px solid #FEB2B2; padding: 6px 10px; border-radius: 6px; font-family: monospace; font-size: 12px; color: #742A2A; direction: rtl; text-align: right;">يا جعفر باند @username</div>
+        </div>
+
+        <div style="font-size: 12px; font-weight: 700; color: #742A2A; margin-bottom: 6px;">أوامر التايم اوت (Timeout):</div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; margin-bottom: 10px;">
+          <div style="background: white; border: 1px solid #FEB2B2; padding: 6px 10px; border-radius: 6px; font-family: monospace; font-size: 12px; color: #742A2A; direction: ltr; text-align: left;">!timeout @username 10m [reason]</div>
+          <div style="background: white; border: 1px solid #FEB2B2; padding: 6px 10px; border-radius: 6px; font-family: monospace; font-size: 12px; color: #742A2A; direction: rtl; text-align: right;">جعفر تايم اوت @username 10m</div>
+          <div style="background: white; border: 1px solid #FEB2B2; padding: 6px 10px; border-radius: 6px; font-family: monospace; font-size: 12px; color: #742A2A; direction: ltr; text-align: left;">!to @username 10m</div>
+          <div style="background: white; border: 1px solid #FEB2B2; padding: 6px 10px; border-radius: 6px; font-family: monospace; font-size: 12px; color: #742A2A; direction: ltr; text-align: left;">@jaafarbot timeout @username 10m</div>
         </div>
         <div style="font-size: 12px; color: #742A2A; line-height: 1.6;">
-          ⏱️ <strong>المدد المدعومة (إلزامية):</strong> <code style="background: white; padding: 2px 6px; border-radius: 4px; font-family: monospace;">10s, 30s, 1m, 5m, 10m, 30m, 1h, 2h, 24h, 1d, 7d</code> (يمكن إضافة سبب اختياري بنهاية الأمر).
+          ⏱️ <strong>مدد التايم اوت (إلزامية للتايم اوت فقط):</strong> <code style="background: white; padding: 2px 6px; border-radius: 4px; font-family: monospace;">10s, 30s, 1m, 5m, 10m, 30m, 1h, 2h, 24h, 1d, 7d</code>
         </div>
       </div>
 
@@ -5301,7 +5791,7 @@ app.get('/', (req, res) => {
           badge.style.color = '#065F46';
           badge.style.borderColor = '#A7F3D0';
           badge.innerText = 'جاهز للتنفيذ عبر Helix API ✓';
-        } else if (mod.oauth && !mod.oauth.hasTimeoutScope) {
+        } else if (mod.oauth && !mod.oauth.hasModerationScope && !mod.oauth.hasTimeoutScope) {
           badge.style.background = '#FFFBEB';
           badge.style.color = '#B45309';
           badge.style.borderColor = '#FDE68A';
