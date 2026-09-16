@@ -715,10 +715,12 @@ async function prepareJaafarChatReplyPipeline({ chatEvent, analysis, record }) {
     promptText += 'رد عليه بأسلوب جعفر العفوي والمحبوب، وبشكل مختصر جداً مناسب للشات.';
   }
 
-  // Inject Twitch Live Stream Visual Memory (What Jaafar saw on stream)
-  const visualContext = getVisualMemoryContext(6);
-  if (visualContext) {
-    promptText += `\n\n[الذاكرة البصرية للبث الحي - ما شاهده جعفر في لقطات البث الأخيرة]:\n${visualContext}\nتنبيه مهم: إذا سُئلت عن أحداث في البث المباشر (مثل وش صار، وش سوا جيف، وش اللعبة، فاز أو خسر)، أجب فقط بناءً على ما رأيته وسُجل في الذاكرة البصرية أعلاه. إذا كان السؤال عن لقطة أو حدث لم تشاهده أو لم يظهر في الفريمات المسجلة، قل بصراحة وعفوية أنك ما شفت اللقطة ذيك وما انتبهت لها، ولا تخترع أبداً أحداثاً من عندك.`;
+  // Inject Twitch Live Stream Visual Memory ONLY if user explicitly asked about stream/screen/gameplay
+  if (needsVisualContext(record.text)) {
+    const visualContext = getVisualMemoryContext(6);
+    if (visualContext) {
+      promptText += `\n\n[الذاكرة البصرية للبث الحي - ما شاهده جعفر في لقطات البث الأخيرة]:\n${visualContext}\nتنبيه مهم: أجب بناءً على ما رأيته وسُجل في الذاكرة البصرية أعلاه. إذا كان السؤال عن لقطة أو حدث لم تشاهده أو لم يظهر في الفريمات المسجلة، قل بصراحة وعفوية أنك ما شفت اللقطة ذيك وما انتبهت لها، ولا تخترع أبداً أحداثاً من عندك.`;
+    }
   }
 
   // Check if user query requires general web search (matches, news, fresh info)
@@ -2616,10 +2618,12 @@ async function processAiQueryEngine({ query, username = 'global' }) {
     const currentSaudiTime = getSaudiTimeContext();
     systemInstruction += `\n\n[معلومات التوقيت والتاريخ الحالي]:\nالتاريخ اليوم بتوقيت الرياض (السعودية) هو: ${currentSaudiTime.dateArabic} (${currentSaudiTime.isoDate})، والساعة الآن: ${currentSaudiTime.timeArabic}. اعتمد هذا التاريخ والوقت كحقيقة مطلقة وحيدة لأي سؤال عن اليوم أو التاريخ أو الوقت الحالي.`;
 
-    // Inject Twitch Live Stream Visual Memory into system instruction
-    const visualContext = getVisualMemoryContext(6);
-    if (visualContext) {
-      systemInstruction += `\n\n[الذاكرة البصرية للبث الحي - ما شاهده جعفر في لقطات البث الأخيرة]:\n${visualContext}\nتنبيه مهم: إذا سُئلت عن شيء حدث في البث المباشر (مثل وش صار، وش اللعبة، وش سوا جيف، فاز أو خسر)، أجب فقط بناءً على ما رأيته وسُجل في الذاكرة البصرية أعلاه. إذا لم تكن اللقطة أو الحدث مسجلاً في الذاكرة البصرية، قل بصراحة وعفوية أنك ما شفت اللقطة ذيك وما انتبهت لها، ولا تخترع أبداً أحداثاً لم تشاهدها.`;
+    // Inject Twitch Live Stream Visual Memory into system instruction ONLY if user asks about stream/gameplay
+    if (needsVisualContext(userMessage)) {
+      const visualContext = getVisualMemoryContext(6);
+      if (visualContext) {
+        systemInstruction += `\n\n[الذاكرة البصرية للبث الحي - ما شاهده جعفر في لقطات البث الأخيرة]:\n${visualContext}\nتنبيه مهم: أجب بناءً على ما رأيته وسُجل في الذاكرة البصرية أعلاه. إذا لم تكن اللقطة أو الحدث مسجلاً في الذاكرة البصرية، قل بصراحة وعفوية أنك ما شفت اللقطة ذيك وما انتبهت لها، ولا تخترع أبداً أحداثاً لم تشاهدها.`;
+      }
     }
 
     if (isJito) {
@@ -3445,6 +3449,51 @@ function formatWebSearchResultsContext(searchData) {
  */
 
 /**
+ * Detects if a chat query explicitly asks about live stream visual/gameplay events,
+ * current game, screen content, or match status.
+ */
+function needsVisualContext(text) {
+  if (!text || typeof text !== 'string') return false;
+  const t = text.trim().toLowerCase();
+
+  // Explicit screen / visual keywords
+  const screenPatterns = [
+    /شاش[ةه]/i,
+    /بالشاش[ةه]/i,
+    /في الشاش[ةه]/i,
+    /على الشاش[ةه]/i,
+    /ظاهر/i,
+    /طالع/i,
+    /فريم/i,
+    /لقط[ةه]/i,
+    /بالبث/i,
+    /في البث/i,
+    /بالستريم/i,
+    /في الستريم/i,
+    /محتوى البث/i,
+  ];
+
+  // Gameplay / what's happening / what Jef is playing / match status patterns
+  const gameplayPatterns = [
+    /(وش|ايش|شنو|شو|ماذا)\s*(يلعب|تلعب|اللعب[ةه]|القيم|الجيم|الكاركتر|الشخصي[ةه]|الهيرو|البطل|السلاح|الرانك|السكور|النتيج[ةه]|صاير|قاعد يصير|جالس يصير|يصير|سوا|سوى|فعل)/i,
+    /(وش|ايش|شنو|شو)\s*(صار|حصل)\s*(في|بال|مع|حق)?\s*(القيم|الجيم|البث|الستريم|اللعب[ةه]|الراوند|الماتش|جيف)?/i,
+    /اسم اللعب[ةه]/i,
+    /شسم اللعب[ةه]/i,
+    /اللعب[ةه] الحالي[ةه]/i,
+    /اللعب[ةه] اللي يلعب/i,
+    /(فاز|خسر|ينهزم|ينتصر)\s*(ولا|أو|او|جيف)?/i,
+    /(كم|وش|ايش)\s*(السكور|النتيجة|النتيج[ةه]|الرانك|الكيلز|كيل|جابلهم|جايب)/i,
+    /كيف (لعبه|اللعب|القيم|الجيم|الماتش)/i,
+    /وش يسوي جيف/i,
+    /ايش يسوي جيف/i,
+    /وين وصل جيف/i,
+    /وين وصل باللعب/i,
+  ];
+
+  return screenPatterns.some(p => p.test(t)) || gameplayPatterns.some(p => p.test(t));
+}
+
+/**
  * Returns a formatted text snippet of recent visual observations for Gemini's context
  */
 function getVisualMemoryContext(limit = 6) {
@@ -3949,21 +3998,30 @@ app.get('/chat-log', (req, res) => {
       --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
     }
 
-    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%;
+      height: 100vh;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
 
     body {
       font-family: var(--font);
       background-color: var(--bg);
       color: var(--text);
       line-height: 1.5;
-      min-height: 100vh;
+      height: 100vh;
+      max-height: 100vh;
       display: flex;
       flex-direction: column;
       overflow: hidden;
+      position: relative;
     }
 
     /* Top App Bar */
     header {
+      flex-shrink: 0;
       background: var(--card-header);
       border-bottom: 1px solid var(--border);
       padding: 10px 16px;
@@ -4034,6 +4092,7 @@ app.get('/chat-log', (req, res) => {
 
     /* Controls Bar */
     .controls-bar {
+      flex-shrink: 0;
       background: var(--card-bg);
       border-bottom: 1px solid var(--border);
       padding: 8px 16px;
@@ -4120,13 +4179,18 @@ app.get('/chat-log', (req, res) => {
 
     /* Chat Messages Container */
     #chatContainer {
-      flex: 1;
+      flex: 1 1 0%;
+      min-height: 0;
+      height: 100%;
+      max-height: 100%;
       overflow-y: auto;
+      overflow-x: hidden;
       padding: 14px 16px;
       display: flex;
       flex-direction: column;
       gap: 4px;
       position: relative;
+      scroll-behavior: smooth;
     }
 
     /* Message Row */
