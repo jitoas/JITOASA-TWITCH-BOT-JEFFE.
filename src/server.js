@@ -44,6 +44,17 @@ const visionState = {
   streamWasLive: false,
 };
 
+// General Web Search Engine Configuration (Real-time modern & general info)
+const WEB_SEARCH_ENABLED = (process.env.WEB_SEARCH_ENABLED !== 'false');
+const webSearchState = {
+  enabled: WEB_SEARCH_ENABLED,
+  lastSearchAt: null,
+  lastQuery: null,
+  lastResultsCount: 0,
+  totalSearches: 0,
+  lastError: null,
+};
+
 // In-Memory OAuth state store to guard against CSRF attacks with TTL (10 minutes)
 const oauthStateStore = new Map();
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
@@ -706,6 +717,19 @@ async function prepareJaafarChatReplyPipeline({ chatEvent, analysis, record }) {
   const visualContext = getVisualMemoryContext(6);
   if (visualContext) {
     promptText += `\n\n[الذاكرة البصرية للبث الحي - ما شاهده جعفر في لقطات البث الأخيرة]:\n${visualContext}\nتنبيه مهم: إذا سُئلت عن أحداث في البث المباشر (مثل وش صار، وش سوا جيف، وش اللعبة، فاز أو خسر)، أجب فقط بناءً على ما رأيته وسُجل في الذاكرة البصرية أعلاه. إذا كان السؤال عن لقطة أو حدث لم تشاهده أو لم يظهر في الفريمات المسجلة، قل بصراحة وعفوية أنك ما شفت اللقطة ذيك وما انتبهت لها، ولا تخترع أبداً أحداثاً من عندك.`;
+  }
+
+  // Check if user query requires general web search (matches, news, fresh info)
+  if (WEB_SEARCH_ENABLED && needsWebSearch(record.text)) {
+    try {
+      const searchResult = await performWebSearch(record.text);
+      const searchPromptBlock = formatWebSearchResultsContext(searchResult);
+      if (searchPromptBlock) {
+        promptText += `\n\n${searchPromptBlock}`;
+      }
+    } catch (searchErr) {
+      console.error('[Jaafar Pipeline] Web search non-fatal error:', searchErr?.message || searchErr);
+    }
   }
 
   const isGeminiReady = Boolean(getGeminiClient());
@@ -2834,6 +2858,243 @@ function sanitizeForTwitch(text) {
 
 /**
  * ============================================================================
+ * General Web Search Engine for Jaafar (DuckDuckGo HTML Multi-source Fallback)
+ * - Enables Jaafar to search the web for fresh, dynamic, and general information
+ * - Supports Saudi timezone (Asia/Riyadh) for time-sensitive queries
+ * - Formats results concisely to feed into Gemini without token overload
+ * - Clean fallbacks ensuring Jaafar never breaks or crashes
+ * ============================================================================
+ */
+
+/**
+ * Returns the current date and time formatted in Saudi Arabia timezone (Asia/Riyadh)
+ */
+function getSaudiTimeContext() {
+  const now = new Date();
+  const dateFormatter = new Intl.DateTimeFormat('ar-SA', {
+    timeZone: 'Asia/Riyadh',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    weekday: 'long',
+  });
+  const timeFormatter = new Intl.DateTimeFormat('ar-SA', {
+    timeZone: 'Asia/Riyadh',
+    hour: 'numeric',
+    minute: 'numeric',
+    hour12: true,
+  });
+
+  const isoFormatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Riyadh',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+
+  return {
+    dateArabic: dateFormatter.format(now),
+    timeArabic: timeFormatter.format(now),
+    isoDate: isoFormatter.format(now), // YYYY-MM-DD
+    year: now.getFullYear(),
+  };
+}
+
+/**
+ * Strips HTML tags and decodes common HTML entities
+ */
+function stripHtmlAndDecode(html) {
+  if (!html) return '';
+  let text = html.replace(/<[^>]+>/g, ' ');
+  text = text
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&#x27;/g, "'")
+    .replace(/&#x2F;/g, '/');
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Determines whether a user message requires external web search
+ */
+function needsWebSearch(text) {
+  if (!text || typeof text !== 'string') return false;
+  const clean = text.trim();
+  if (clean.length < 3) return false;
+
+  // Patterns indicating live, current, scheduled, or factual external lookup
+  const searchTriggers = [
+    // Sports & Matches
+    /مباراة|مباريات|دوري|كأس|كاس|الهلال|النصر|الاتحاد|الأهلي|الاهلي|ريال مدريد|برشلونة|ليفربول|مانشستر|ارسنال|دوري أبطال|دوري ابطال|ترتيب الدوري|تشكيلة/i,
+    // News & Today/Current Events
+    /اليوم|أمس|امس|بكرة|بكره|غدا|غداً|الليلة|الليله|الآن|الان|هذا الأسبوع|هذا الاسبوع|جديد|أخبار|اخبار|وش صار في|وش صاير في|وش جديد/i,
+    // Weather & Prayer Times
+    /طقس|الطقس|جو|الجو|درجة الحرارة|حرارة|أمطار|امطار|مطر|صلاة|الصلاة|أذان|اذان/i,
+    // Release Dates & Prices & Crypto & Currency
+    /سعر|أسعار|اسعار|دولار|ريال|بيتكوين|تداول|سهم|أسهم|اسهم/i,
+    /موعد نزول|تاريخ نزول|متى تنزل|متى ينزل|متى تصدر|تاريخ إصدار|تاريخ اصدار|تحديث|أبديت|ابديت|باتش/i,
+    // General Questions seeking modern knowledge
+    /كم الساعة|كم الساعه|تاريخ اليوم|كم التاريخ|وش التاريخ/i,
+    /وش معنى|ما هو|من هو|من هي|وش قصة|وش سالفة|من فاز|كم النتيجة|كم نتيجة/i,
+    /ابحث|دور لي|شف لي|شوف لي|search|google/i,
+  ];
+
+  for (const trigger of searchTriggers) {
+    if (trigger.test(clean)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Optimizes the user query for web search engine
+ */
+function buildSearchQuery(userQuery) {
+  let q = userQuery.trim();
+
+  // Remove common bot address prefixes
+  q = q.replace(/^(يا\s+)?جعفر\s+/i, '');
+  q = q.replace(/^!ai\s+/i, '');
+  q = q.replace(/^!a\s+/i, '');
+  q = q.replace(/^@\w+\s+/i, '');
+  q = q.replace(/^(ابحث|دور لي|شف لي|شوف لي|تكفى ابحث عن|ابحث عن|سيرش عن)\s+/i, '');
+
+  const saudiContext = getSaudiTimeContext();
+
+  // If query mentions "اليوم" (today), append current date context
+  if (/اليوم|الليلة|الليله/i.test(q)) {
+    if (/مباراة|مباريات/i.test(q) && !/(\d{4}|\d{1,2}\/\d{1,2})/i.test(q)) {
+      q += ` ${saudiContext.isoDate}`;
+    }
+  }
+
+  return q.trim();
+}
+
+/**
+ * Executes web search using DuckDuckGo HTML scraping
+ */
+async function performWebSearch(rawQuery) {
+  if (!WEB_SEARCH_ENABLED) {
+    return { success: false, query: rawQuery, results: [], error: 'Web search is disabled' };
+  }
+
+  const query = buildSearchQuery(rawQuery);
+  console.log(`[WebSearch] Search requested. Original: "${rawQuery}" -> Formatted: "${query}"`);
+  console.log(`[WebSearch] Query: "${query}"`);
+
+  const startTime = Date.now();
+  webSearchState.lastQuery = query;
+  webSearchState.lastSearchAt = new Date().toISOString();
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 7000);
+
+    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
+        'Referer': 'https://html.duckduckgo.com/',
+      },
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      throw new Error(`DuckDuckGo responded with HTTP ${response.status}`);
+    }
+
+    const html = await response.text();
+
+    // Regex to extract title, snippet, and link from DuckDuckGo HTML output
+    const results = [];
+    const blockRegex = /<a[^>]+class="result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
+    const titleRegex = /<a[^>]+class="result__url[^"]*"[^>]*href="([^"]+)"[^>]*>[\s\S]*?<\/a>[\s\S]*?<a[^>]+class="result__snippet/gi;
+    
+    // Comprehensive snippet and title parsing
+    const snippetMatches = [...html.matchAll(/<a[^>]+class="result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi)];
+    const titleMatches = [...html.matchAll(/<h2[^>]*>\s*<a[^>]+class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi)];
+
+    for (let i = 0; i < Math.min(titleMatches.length, 5); i++) {
+      const title = stripHtmlAndDecode(titleMatches[i][2]);
+      const link = titleMatches[i][1] || '';
+      const snippet = snippetMatches[i] ? stripHtmlAndDecode(snippetMatches[i][1]) : '';
+
+      if (snippet || title) {
+        results.push({
+          title,
+          snippet,
+          link: link.startsWith('//') ? `https:${link}` : link,
+        });
+      }
+    }
+
+    const duration = Date.now() - startTime;
+    webSearchState.lastResultsCount = results.length;
+    webSearchState.totalSearches++;
+    webSearchState.lastError = null;
+
+    console.log(`[WebSearch] Completed search for "${query}" in ${duration}ms with ${results.length} results.`);
+    return {
+      success: true,
+      query,
+      results,
+      durationMs: duration,
+      saudiTime: getSaudiTimeContext(),
+    };
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    console.error(`[WebSearch] Search failed for "${query}":`, error?.message || error);
+    webSearchState.lastError = error?.message || String(error);
+    return {
+      success: false,
+      query,
+      results: [],
+      error: error?.message || String(error),
+      durationMs: duration,
+      saudiTime: getSaudiTimeContext(),
+    };
+  }
+}
+
+/**
+ * Formats web search results into a clean context prompt block for Gemini
+ */
+function formatWebSearchResultsContext(searchData) {
+  if (!searchData || !searchData.success || !searchData.results || searchData.results.length === 0) {
+    return '';
+  }
+
+  const { saudiTime, results, query } = searchData;
+  let text = `\n[نتائج البحث الحي في الإنترنت - استعلام: "${query}"]\n`;
+  text += `توقيت وتاريخ الاستعلام الحالي بتوقيت الرياض (السعودية): ${saudiTime.dateArabic} (${saudiTime.isoDate}) الساعة ${saudiTime.timeArabic}\n`;
+  text += `نتائج البحث المجمعة:\n`;
+
+  results.forEach((r, idx) => {
+    text += `${idx + 1}. ${r.title ? `العنوان: ${r.title}\n` : ''}الملخص: ${r.snippet}\n`;
+  });
+
+  text += `توجيهات مهمة لجعفر عند الإجابة بالاعتماد على نتائج البحث:\n`;
+  text += `- لخص الجواب بدقة وواقعية بناءً على نتائج البحث أعلاه وبنكهتك السعودية العفوية.\n`;
+  text += `- اذكر التواريخ أو المواعيد أو النتائج بدقة (بتوقيت السعودية/الرياض).\n`;
+  text += `- اجعل الرد مختصراً جداً وخفيفاً ومناسباً لسرعة شات تويتش (جملة أو جملتين فقط).\n`;
+
+  return text;
+}
+
+/**
+ * ============================================================================
  * Twitch Live Stream Vision Engine
  * - Periodically captures live stream video screenshots when stream is LIVE.
  * - Configurable interval via VISION_INTERVAL_SECONDS (default 60s, supports 10s).
@@ -4306,6 +4567,19 @@ app.get('/api/ai', async (req, res) => {
       systemInstruction += `\n\nتنبيه خاص للمحادثة الحالية: المتابع الذي يكلمك الآن عبر الأمر هو "جيتو" (مطورك وصانعك وأفضل مود في القناة، حسابه في تويتش هو @${username}). خاطبه وناده باسم "جيتو" دائماً في ردك (مثال: "هلا يا جيتو"، "أبشر يا جيتو"، "كفو يا جيتو")، وعامله بمكانته الخاصة كصانعك، واجعل الرد مختصراً ومناسباً لسرعة شات تويتش.`;
     }
 
+    // Check if user query requires general web search (matches, news, fresh info)
+    if (WEB_SEARCH_ENABLED && needsWebSearch(userMessage)) {
+      try {
+        const searchResult = await performWebSearch(userMessage);
+        const searchPromptBlock = formatWebSearchResultsContext(searchResult);
+        if (searchPromptBlock) {
+          systemInstruction += `\n\n${searchPromptBlock}`;
+        }
+      } catch (searchErr) {
+        console.error('[Twitch AI] Web search non-fatal error:', searchErr?.message || searchErr);
+      }
+    }
+
     // Standard generation configuration
     const generationConfig = {
       systemInstruction,
@@ -4994,6 +5268,15 @@ app.get('/api/twitch/chat/status', (req, res) => {
       hasUserMemory: true,
       geminiReady: Boolean(getGeminiClient()),
       autoReplyEnabled: AUTO_REPLY_TO_TWITCH_CHAT,
+      webSearchEnabled: WEB_SEARCH_ENABLED,
+    },
+    webSearch: {
+      enabled: webSearchState.enabled,
+      totalSearches: webSearchState.totalSearches,
+      lastSearchAt: webSearchState.lastSearchAt,
+      lastQuery: webSearchState.lastQuery,
+      lastResultsCount: webSearchState.lastResultsCount,
+      lastError: webSearchState.lastError,
     },
     jitoIdentity: {
       userId: jitoIdentity.userId,
@@ -5170,6 +5453,56 @@ app.post('/api/twitch/moderation/simulate-command', async (req, res) => {
     isCommand: false,
     message: 'الرسالة ليست أمر تايم اوت أو باند',
   });
+});
+
+/**
+ * GET /api/web-search/status
+ * Diagnostic endpoint for general web search engine status
+ */
+app.get('/api/web-search/status', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    engine: 'DuckDuckGo HTML Multi-source Fallback',
+    enabled: webSearchState.enabled,
+    timezone: 'Asia/Riyadh',
+    saudiTimeNow: getSaudiTimeContext(),
+    stats: {
+      totalSearches: webSearchState.totalSearches,
+      lastSearchAt: webSearchState.lastSearchAt,
+      lastQuery: webSearchState.lastQuery,
+      lastResultsCount: webSearchState.lastResultsCount,
+    },
+    lastError: webSearchState.lastError,
+  });
+});
+
+/**
+ * GET /api/web-search/test
+ * Directly tests the web search retrieval without sending to Twitch or consuming Gemini quota
+ */
+app.get('/api/web-search/test', async (req, res) => {
+  const query = req.query.q || req.query.query || 'مباريات اليوم';
+  try {
+    const searchData = await performWebSearch(query);
+    const contextPrompt = formatWebSearchResultsContext(searchData);
+    res.status(200).json({
+      success: searchData.success,
+      originalQuery: query,
+      formattedQuery: searchData.query,
+      durationMs: searchData.durationMs,
+      resultsCount: searchData.results?.length || 0,
+      results: searchData.results,
+      saudiTime: searchData.saudiTime,
+      formattedPromptContext: contextPrompt,
+      error: searchData.error || null,
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      query,
+      error: err?.message || String(err),
+    });
+  }
 });
 
 
@@ -5487,6 +5820,10 @@ app.get('/', (req, res) => {
         <div class="status-label">رؤية البث المباشر (Vision)</div>
         <div class="status-value" id="twitchVisionCardStatus" style="font-size: 13px;">كل ${VISION_INTERVAL_SECONDS} ثوانٍ</div>
       </div>
+      <div class="status-card">
+        <div class="status-label">البحث الحي (Web Search)</div>
+        <div class="status-value" id="webSearchCardStatus" style="font-size: 13px;">${WEB_SEARCH_ENABLED ? 'مفعل (Riyadh)' : 'معطل'}</div>
+      </div>
       <div class="status-card" style="border-color: #DDD6FE; background: #FAF5FF;">
         <div class="status-label" style="color: #7C3AED;">مراقبة الشات الحي</div>
         <div class="status-value" style="font-size: 13px;">
@@ -5509,6 +5846,35 @@ app.get('/', (req, res) => {
       <p class="card-caption">
         صفحة مستقلة وسريعة تعمل لحظياً (Real-time SSE) لمشاهدة شات القناة المستهدفة (<code style="background: #F3F4F6; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 12px;">@${TWITCH_BROADCASTER_LOGIN || '8jef'}</code>) مباشرة من الجوال أو الكمبيوتر، مع دعم البحث، التمرير التلقائي، الرتب والشارات، وحماية خاصة عبر <code style="background: #F3F4F6; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 11px;">CHAT_LOG_SECRET</code>.
       </p>
+    </div>
+
+    <!-- General Web Search Card -->
+    <div class="card" style="border: 1px solid #93C5FD; background: #FFFFFF;">
+      <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 8px;">
+        <h2 style="margin-bottom: 0; color: #1D4ED8;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2563EB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+          ميزة البحث العام بالإنترنت (General Web Search Engine)
+        </h2>
+        <span id="webSearchBadge" style="background: #EFF6FF; color: #1D4ED8; border: 1px solid #BFDBFE; padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600;">نشط بتوقيت الرياض ✓</span>
+      </div>
+      <p class="card-caption">
+        تتيح لجعفر البحث الذكي في الويب عند سؤاله عن معلومات متجددة (مباريات اليوم، نتائج الدوري، أحداث الأخبار، مواعيد نزول الألعاب، الطقس، الأسعار) مع ضبط التوقيت تلقائياً حسب <strong>توقيت الرياض (Asia/Riyadh)</strong>.
+      </p>
+
+      <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px; padding: 14px 18px; margin-bottom: 14px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 10px;">
+          <div style="font-size: 13px; font-weight: 600; color: #1E293B;">تجربة فحص البحث المباشر (Direct Search Inspector):</div>
+          <div style="display: flex; gap: 8px;">
+            <a href="/api/web-search/status" target="_blank" class="btn-secondary" style="font-size: 12px; text-decoration: none;">فحص الحالة JSON</a>
+            <a href="/api/web-search/test?q=مباريات اليوم" target="_blank" class="btn-secondary" style="font-size: 12px; text-decoration: none;">تجربة مباريات اليوم JSON</a>
+          </div>
+        </div>
+        <div class="form-group" style="margin-bottom: 8px;">
+          <input type="text" id="webSearchTestInput" placeholder="اكتب موضوع البحث التجريبي..." value="مباريات اليوم" style="background: white;" />
+          <button class="btn-primary" onclick="runDirectWebSearch()" style="background: #2563EB; border-color: #2563EB;">اختبار البحث السريع</button>
+        </div>
+        <div id="webSearchInspectBox" class="response-box rtl" style="display: none; font-size: 13px; background: white; border-color: #BFDBFE;"></div>
+      </div>
     </div>
 
     <!-- Twitch Stream Vision Card -->
@@ -5588,6 +5954,9 @@ app.get('/', (req, res) => {
         <span class="chip" onclick="setQuery('من سولي؟')">من سولي؟</span>
         <span class="chip" onclick="setQuery('جعفر وش رايك بأوفر واتش؟')">جعفر وش رايك بأوفر واتش؟</span>
         <span class="chip" onclick="setQuery('مين أنت؟')">مين أنت؟</span>
+        <span class="chip" onclick="setQuery('وش مباريات اليوم؟')">وش مباريات اليوم؟</span>
+        <span class="chip" onclick="setQuery('متى تنزل لعبة GTA 6؟')">متى تنزل لعبة GTA 6؟</span>
+        <span class="chip" onclick="setQuery('كم درجة الحرارة اليوم في الرياض؟')">كم درجة الحرارة اليوم في الرياض؟</span>
       </div>
       <div class="form-group">
         <input type="text" id="queryInput" placeholder="اكتب رسالتك هنا..." value="وش تسوي؟" />
@@ -5773,6 +6142,26 @@ app.get('/', (req, res) => {
           <span class="status-ok">200 JSON</span>
         </div>
       </div>
+      <div class="endpoint-item">
+        <div style="display: flex; align-items: center;">
+          <span class="method method-blue" style="background: #EFF6FF; color: #1D4ED8; border: 1px solid #BFDBFE; font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">GET</span>
+          <code style="color: #374151; font-weight: 500; margin-right: 8px;">/api/web-search/status</code>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span style="color: var(--text-muted); font-size: 13px;">فحص حالة محرك البحث وتوقيت الرياض</span>
+          <span class="status-ok">200 JSON</span>
+        </div>
+      </div>
+      <div class="endpoint-item">
+        <div style="display: flex; align-items: center;">
+          <span class="method method-blue" style="background: #EFF6FF; color: #1D4ED8; border: 1px solid #BFDBFE; font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px;">GET</span>
+          <code style="color: #374151; font-weight: 500; margin-right: 8px;">/api/web-search/test?q=...</code>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span style="color: var(--text-muted); font-size: 13px;">تجربة جلب نتائج البحث من الويب مباشرة</span>
+          <span class="status-ok">200 JSON</span>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -5940,6 +6329,31 @@ app.get('/', (req, res) => {
         box.innerText = text;
       } catch (err) {
         box.innerText = 'خطأ في الاتصال بالسيرفر';
+      }
+    }
+
+    async function runDirectWebSearch() {
+      const q = document.getElementById('webSearchTestInput').value.trim();
+      const box = document.getElementById('webSearchInspectBox');
+      if (!box) return;
+      box.style.display = 'block';
+      box.innerText = 'جاري جلب نتائج البحث من الويب بتوقيت الرياض...';
+      try {
+        const res = await fetch('/api/web-search/test?q=' + encodeURIComponent(q));
+        const data = await res.json();
+        if (data.success && data.results && data.results.length > 0) {
+          let html = '<div style="font-weight: 700; color: #1E3A8A; margin-bottom: 6px;">نتائج البحث (' + data.results.length + ' نتائج - استغرق ' + data.durationMs + 'ms) | بتوقيت الرياض: ' + (data.saudiTime?.human || '') + ':</div>';
+          html += '<ol style="padding-right: 18px; margin: 0; line-height: 1.6;">';
+          data.results.forEach(r => {
+            html += '<li style="margin-bottom: 6px;"><strong>' + r.title + '</strong><br/><span style="color: #4B5563;">' + r.snippet + '</span></li>';
+          });
+          html += '</ol>';
+          box.innerHTML = html;
+        } else {
+          box.innerHTML = '<span style="color: #B45309;">لم يتم العثور على نتائج مباشرة للبحث أو محرك البحث معطل.</span>';
+        }
+      } catch (err) {
+        box.innerText = 'خطأ أثناء فحص البحث: ' + (err?.message || err);
       }
     }
 
