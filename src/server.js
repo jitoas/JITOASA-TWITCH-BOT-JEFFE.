@@ -1375,7 +1375,17 @@ async function startTwitchChatConnection(customWsUrl = null) {
         if (subType === 'channel.chat.message') {
           const chatEvent = data.payload.event;
           const chatterName = chatEvent.chatter_user_name || chatEvent.chatter_user_login || 'unknown';
+          const chatterLogin = (chatEvent.chatter_user_login || chatterName).toLowerCase();
           const messageText = chatEvent.message?.text || '';
+
+          // Anti-Loop Guard: Ignore any message sent from jaafarbot itself
+          const botLogin = (twitchAuthState.user?.login || 'jaafarbot').toLowerCase();
+          const botId = twitchAuthState.user?.id ? String(twitchAuthState.user.id) : null;
+          const chatterId = chatEvent.chatter_user_id ? String(chatEvent.chatter_user_id) : null;
+          if (chatterLogin === botLogin || (botId && chatterId && chatterId === botId)) {
+            // Do not process messages from bot itself to prevent infinite loops
+            return;
+          }
 
           // 0. Detect and learn Jito identity dynamically if applicable
           learnJitoIdentityFromChat(chatEvent);
@@ -1417,6 +1427,14 @@ async function startTwitchChatConnection(customWsUrl = null) {
           const timeoutCmd = parseTimeoutCommand(messageText, twitchAuthState.user?.login);
           if (timeoutCmd && timeoutCmd.isCommand) {
             await handleTimeoutCommand({ chatEvent, timeoutCmd });
+            return;
+          }
+
+          // 3.6. Direct !ai command check (Jaafar native Twitch chat command)
+          // Handles: !ai, !ai [question] from any chatter directly in Twitch chat
+          const aiCmd = parseAiChatCommand(messageText);
+          if (aiCmd && aiCmd.isCommand) {
+            await handleDirectAiChatCommand({ chatEvent, aiCmd });
             return;
           }
 
@@ -2423,6 +2441,214 @@ async function handleBanCommand({ chatEvent, banCmd }) {
     await sendTwitchChatMessage(`⛔ تم حظر المستخدم @${result.targetDisplayName} نهائياً (Permanent Ban)${reasonMsg} بواسطة @${chatterName}.`);
   } else {
     await sendTwitchChatMessage(`@${chatterName} ⚠️ ${result.message || 'تعذر تنفيذ الباند.'}`);
+  }
+}
+
+/**
+ * Parses "!ai [question]" command from chat message text
+ * Supports:
+ * - "!ai" or "!ai [question]" (case-insensitive)
+ * - "!AI", "!Ai", "!aI"
+ * - Returns { isCommand: boolean, hasQuestion: boolean, question: string }
+ */
+function parseAiChatCommand(rawText) {
+  if (!rawText || typeof rawText !== 'string') {
+    return { isCommand: false, hasQuestion: false, question: '' };
+  }
+  const trimmed = rawText.trim();
+  // Match "!ai" at the beginning of the message followed by end of string or whitespace
+  const match = trimmed.match(/^!ai(\s+([\s\S]*))?$/i);
+  if (!match) {
+    return { isCommand: false, hasQuestion: false, question: '' };
+  }
+  const question = (match[2] || '').trim();
+  return {
+    isCommand: true,
+    hasQuestion: question.length > 0,
+    question,
+  };
+}
+
+/**
+ * Shared Core AI Pipeline for Jaafar:
+ * Shared between GET /api/ai (Nightbot / Web API) and Twitch Chat direct !ai command.
+ * Strictly uses:
+ * - Google Gemini (with model retry & fallback)
+ * - General Web Search (when needsWebSearch is true, Saudi Arabia / Riyadh timezone)
+ * - Twitch Live Stream Visual Memory
+ * - User Memory (per-user conversation history & Jito identity recognition)
+ * - sanitizeForTwitch text sanitizer
+ * - Safe error handling
+ */
+async function processAiQueryEngine({ query, username = 'global' }) {
+  const rawUser = (username && typeof username === 'string' && username.trim()) ? username.trim() : 'global';
+  const isJito = isJitoChatter(rawUser);
+  const userKey = isJito ? getJitoMemoryKey() : rawUser.toLowerCase();
+
+  // Handle empty query
+  if (!query || typeof query !== 'string' || !query.trim()) {
+    return {
+      success: true,
+      text: 'اكتب سؤالك بعد !ai 😎',
+      isEmpty: true,
+    };
+  }
+
+  // 1. Lightweight per-user concurrency guard: prevent spamming multiple requests simultaneously
+  if (userKey !== 'global' && activeUserRequests.has(userKey)) {
+    return {
+      success: true,
+      text: 'اصبر شوي يا وحش، باقي أرد على رسالتك الأولى! 😂',
+      isRateLimited: true,
+    };
+  }
+
+  // 2. Lightweight global concurrency limit: avoid overloading Gemini with concurrent bursts
+  if (activeGlobalRequests >= MAX_GLOBAL_CONCURRENT) {
+    return {
+      success: true,
+      text: 'الشات زحمة والضغط عالي شوي، ثواني وراجع لكم! 😂',
+      isRateLimited: true,
+    };
+  }
+
+  if (userKey !== 'global') {
+    activeUserRequests.add(userKey);
+  }
+  activeGlobalRequests++;
+
+  try {
+    const userMessage = query.trim().slice(0, 400);
+
+    const ai = getGeminiClient();
+    if (!ai) {
+      console.warn('[Twitch AI] GEMINI_API_KEY is not set in environment variables');
+      return {
+        success: false,
+        text: 'الـAI مشغول شوي 😂',
+      };
+    }
+
+    const userState = getUserState(userKey);
+
+    // Prepare multi-turn contents with recent history for context
+    const conversationContents = [
+      ...userState.history.slice(-MAX_HISTORY_MESSAGES),
+      { role: 'user', parts: [{ text: userMessage }] },
+    ];
+
+    let systemInstruction = SYSTEM_INSTRUCTION;
+
+    // Inject Twitch Live Stream Visual Memory into system instruction
+    const visualContext = getVisualMemoryContext(6);
+    if (visualContext) {
+      systemInstruction += `\n\n[الذاكرة البصرية للبث الحي - ما شاهده جعفر في لقطات البث الأخيرة]:\n${visualContext}\nتنبيه مهم: إذا سُئلت عن شيء حدث في البث المباشر (مثل وش صار، وش اللعبة، وش سوا جيف، فاز أو خسر)، أجب فقط بناءً على ما رأيته وسُجل في الذاكرة البصرية أعلاه. إذا لم تكن اللقطة أو الحدث مسجلاً في الذاكرة البصرية، قل بصراحة وعفوية أنك ما شفت اللقطة ذيك وما انتبهت لها، ولا تخترع أبداً أحداثاً لم تشاهدها.`;
+    }
+
+    if (isJito) {
+      systemInstruction += `\n\nتنبيه خاص للمحادثة الحالية: المتابع الذي يكلمك الآن عبر الأمر هو "جيتو" (مطورك وصانعك وأفضل مود في القناة، حسابه في تويتش هو @${rawUser}). خاطبه وناده باسم "جيتو" دائماً في ردك (مثال: "هلا يا جيتو"، "أبشر يا جيتو"، "كفو يا جيتو")، وعامله بمكانته الخاصة كصانعك، واجعل الرد مختصراً ومناسباً لسرعة شات تويتش.`;
+    }
+
+    // Check if user query requires general web search (matches, news, fresh info)
+    if (WEB_SEARCH_ENABLED && needsWebSearch(userMessage)) {
+      try {
+        const searchResult = await performWebSearch(userMessage);
+        const searchPromptBlock = formatWebSearchResultsContext(searchResult);
+        if (searchPromptBlock) {
+          systemInstruction += `\n\n${searchPromptBlock}`;
+        }
+      } catch (searchErr) {
+        console.error('[Twitch AI] Web search non-fatal error:', searchErr?.message || searchErr);
+      }
+    }
+
+    // Standard generation configuration
+    const generationConfig = {
+      systemInstruction,
+      temperature: 0.85,
+      maxOutputTokens: 120,
+    };
+
+    // Call Gemini Flash model with smart retry and fallback handling
+    const response = await generateWithRetryAndFallback(ai, {
+      contents: conversationContents,
+      config: generationConfig,
+    });
+
+    const reply = sanitizeForTwitch(response.text) || 'هلا والله 👋';
+
+    // Update conversation history
+    userState.history.push({ role: 'user', parts: [{ text: userMessage }] });
+    userState.history.push({ role: 'model', parts: [{ text: reply }] });
+    if (userState.history.length > MAX_HISTORY_MESSAGES) {
+      userState.history = userState.history.slice(-MAX_HISTORY_MESSAGES);
+    }
+
+    // Check if the reply asks an explicit question to save as the last question
+    const question = extractQuestion(reply);
+    if (question) {
+      userState.lastQuestion = {
+        question,
+        askedAt: Date.now(),
+        userName: rawUser,
+      };
+    }
+
+    return {
+      success: true,
+      text: reply,
+    };
+  } catch (error) {
+    console.error('[Twitch AI] Error generating response:', error?.message || error);
+    return {
+      success: false,
+      text: 'الـAI مشغول شوي 😂',
+      error: error?.message || error,
+    };
+  } finally {
+    if (userKey !== 'global') {
+      activeUserRequests.delete(userKey);
+    }
+    activeGlobalRequests = Math.max(0, activeGlobalRequests - 1);
+  }
+}
+
+/**
+ * Handles incoming !ai command directly from Twitch chat EventSub
+ */
+async function handleDirectAiChatCommand({ chatEvent, aiCmd }) {
+  const chatterName = chatEvent.chatter_user_name || chatEvent.chatter_user_login || 'viewer';
+  const chatterLogin = (chatEvent.chatter_user_login || chatterName).toLowerCase();
+
+  console.log(`[ChatCommand] !ai received: "${chatEvent.message?.text || ''}"`);
+  console.log(`[ChatCommand] !ai user: ${chatterName} (${chatterLogin})`);
+
+  // If user provided !ai without any question
+  if (!aiCmd.hasQuestion) {
+    console.log(`[ChatCommand] !ai empty prompt received from @${chatterName}, sending hint.`);
+    const hintMsg = `@${chatterName} اكتب سؤالك بعد !ai 😎`;
+    await sendTwitchChatMessage(hintMsg);
+    console.log(`[ChatCommand] !ai response sent`);
+    return;
+  }
+
+  console.log(`[ChatCommand] !ai processing question: "${aiCmd.question}"`);
+
+  try {
+    const aiOutput = await processAiQueryEngine({
+      query: aiCmd.question,
+      username: chatterLogin,
+    });
+
+    const replyText = aiOutput.text || 'هلا والله 👋';
+    const messageToSend = `@${chatterName} ${replyText}`;
+
+    await sendTwitchChatMessage(messageToSend);
+    console.log(`[ChatCommand] !ai response sent: "${messageToSend.slice(0, 100)}..."`);
+  } catch (err) {
+    console.error('[ChatCommand] !ai unexpected error:', err?.message || err);
+    await sendTwitchChatMessage(`@${chatterName} الـAI مشغول شوي 😂`);
+    console.log(`[ChatCommand] !ai response sent (fallback)`);
   }
 }
 
@@ -4501,8 +4727,6 @@ app.get('/api/ai', async (req, res) => {
   const rawQuery = req.query.q;
   const rawUser = req.query.user;
   const username = (rawUser && typeof rawUser === 'string' && rawUser.trim()) ? rawUser.trim() : 'global';
-  const isJito = isJitoChatter(username);
-  const userKey = isJito ? getJitoMemoryKey() : username.toLowerCase();
 
   // Handle empty query parameter gracefully
   if (!rawQuery || typeof rawQuery !== 'string' || !rawQuery.trim()) {
@@ -4512,123 +4736,15 @@ app.get('/api/ai', async (req, res) => {
       .send('وش تبي تقول؟ اكتب رسالتك بعد الأمر يا غالي 👋');
   }
 
-  // 1. Lightweight per-user concurrency guard: prevent spamming multiple requests simultaneously
-  if (userKey !== 'global' && activeUserRequests.has(userKey)) {
-    return res
-      .type('text/plain; charset=utf-8')
-      .status(200)
-      .send('اصبر شوي يا وحش، باقي أرد على رسالتك الأولى! 😂');
-  }
+  const result = await processAiQueryEngine({
+    query: rawQuery,
+    username,
+  });
 
-  // 2. Lightweight global concurrency limit: avoid overloading Gemini with concurrent bursts
-  if (activeGlobalRequests >= MAX_GLOBAL_CONCURRENT) {
-    return res
-      .type('text/plain; charset=utf-8')
-      .status(200)
-      .send('الشات زحمة والضغط عالي شوي، ثواني وراجع لكم! 😂');
-  }
-
-  if (userKey !== 'global') {
-    activeUserRequests.add(userKey);
-  }
-  activeGlobalRequests++;
-
-  try {
-    // Protect against excessively large inputs
-    const userMessage = rawQuery.trim().slice(0, 400);
-
-    // Check Gemini API key
-    const ai = getGeminiClient();
-    if (!ai) {
-      console.warn('[Twitch AI] GEMINI_API_KEY is not set in environment variables');
-      return res
-        .type('text/plain; charset=utf-8')
-        .status(200)
-        .send('الـAI مشغول شوي 😂');
-    }
-
-    const userState = getUserState(userKey);
-
-    // Prepare multi-turn contents with recent history for context
-    const conversationContents = [
-      ...userState.history.slice(-MAX_HISTORY_MESSAGES),
-      { role: 'user', parts: [{ text: userMessage }] },
-    ];
-
-    let systemInstruction = SYSTEM_INSTRUCTION;
-
-    // Inject Twitch Live Stream Visual Memory into system instruction
-    const visualContext = getVisualMemoryContext(6);
-    if (visualContext) {
-      systemInstruction += `\n\n[الذاكرة البصرية للبث الحي - ما شاهده جعفر في لقطات البث الأخيرة]:\n${visualContext}\nتنبيه مهم: إذا سُئلت عن شيء حدث في البث المباشر (مثل وش صار، وش اللعبة، وش سوا جيف، فاز أو خسر)، أجب فقط بناءً على ما رأيته وسُجل في الذاكرة البصرية أعلاه. إذا لم تكن اللقطة أو الحدث مسجلاً في الذاكرة البصرية، قل بصراحة وعفوية أنك ما شفت اللقطة ذيك وما انتبهت لها، ولا تخترع أبداً أحداثاً لم تشاهدها.`;
-    }
-
-    if (isJito) {
-      systemInstruction += `\n\nتنبيه خاص للمحادثة الحالية: المتابع الذي يكلمك الآن عبر الأمر هو "جيتو" (مطورك وصانعك وأفضل مود في القناة، حسابه في تويتش هو @${username}). خاطبه وناده باسم "جيتو" دائماً في ردك (مثال: "هلا يا جيتو"، "أبشر يا جيتو"، "كفو يا جيتو")، وعامله بمكانته الخاصة كصانعك، واجعل الرد مختصراً ومناسباً لسرعة شات تويتش.`;
-    }
-
-    // Check if user query requires general web search (matches, news, fresh info)
-    if (WEB_SEARCH_ENABLED && needsWebSearch(userMessage)) {
-      try {
-        const searchResult = await performWebSearch(userMessage);
-        const searchPromptBlock = formatWebSearchResultsContext(searchResult);
-        if (searchPromptBlock) {
-          systemInstruction += `\n\n${searchPromptBlock}`;
-        }
-      } catch (searchErr) {
-        console.error('[Twitch AI] Web search non-fatal error:', searchErr?.message || searchErr);
-      }
-    }
-
-    // Standard generation configuration
-    const generationConfig = {
-      systemInstruction,
-      temperature: 0.85,
-      maxOutputTokens: 120,
-    };
-
-    // Call Gemini Flash model with smart retry and fallback handling
-    const response = await generateWithRetryAndFallback(ai, {
-      contents: conversationContents,
-      config: generationConfig,
-    });
-
-    const reply = sanitizeForTwitch(response.text) || 'هلا والله 👋';
-
-    // Update conversation history
-    userState.history.push({ role: 'user', parts: [{ text: userMessage }] });
-    userState.history.push({ role: 'model', parts: [{ text: reply }] });
-    if (userState.history.length > MAX_HISTORY_MESSAGES) {
-      userState.history = userState.history.slice(-MAX_HISTORY_MESSAGES);
-    }
-
-    // Check if the reply asks an explicit question to save as the last question
-    const question = extractQuestion(reply);
-    if (question) {
-      userState.lastQuestion = {
-        question: question,
-        askedAt: Date.now(),
-        userName: username,
-      };
-    }
-
-    return res
-      .type('text/plain; charset=utf-8')
-      .status(200)
-      .send(reply);
-  } catch (error) {
-    console.error('[Twitch AI] Error generating response:', error?.message || error);
-    // Never crash the server, return a friendly fallback in Saudi Arabic
-    return res
-      .type('text/plain; charset=utf-8')
-      .status(200)
-      .send('الـAI مشغول شوي 😂');
-  } finally {
-    if (userKey !== 'global') {
-      activeUserRequests.delete(userKey);
-    }
-    activeGlobalRequests = Math.max(0, activeGlobalRequests - 1);
-  }
+  return res
+    .type('text/plain; charset=utf-8')
+    .status(200)
+    .send(result.text || 'هلا والله 👋');
 });
 
 /**
