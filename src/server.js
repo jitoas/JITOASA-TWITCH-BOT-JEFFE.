@@ -26,6 +26,24 @@ const TWITCH_SCOPES = [
 // Target Broadcaster Twitch Channel Name (configured via environment variable)
 const TWITCH_BROADCASTER_LOGIN = (process.env.TWITCH_BROADCASTER_LOGIN || '').trim();
 
+// Twitch Stream Vision System Configuration
+// Automatically captures stream screenshots periodically when stream is LIVE
+const VISION_ENABLED = (process.env.VISION_ENABLED !== 'false');
+const VISION_INTERVAL_SECONDS = Math.max(5, parseInt(process.env.VISION_INTERVAL_SECONDS || '60', 10) || 60);
+
+const visionState = {
+  enabled: VISION_ENABLED,
+  intervalSeconds: VISION_INTERVAL_SECONDS,
+  lastCaptureAt: null,
+  lastAnalysisAt: null,
+  lastStatus: 'idle', // 'idle' | 'capturing' | 'analyzed' | 'unchanged' | 'offline' | 'error'
+  lastFrameHash: null,
+  lastError: null,
+  timer: null,
+  isChecking: false,
+  streamWasLive: false,
+};
+
 // In-Memory OAuth state store to guard against CSRF attacks with TTL (10 minutes)
 const oauthStateStore = new Map();
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
@@ -269,6 +287,11 @@ async function restoreTwitchAuthAndConnect() {
   // Ensure user profile details are populated
   await ensureTwitchUserProfile();
 
+  // Proactively resolve Jito's permanent Twitch User ID
+  resolveJitoTwitchIdentity().catch(err => {
+    console.warn('[Jito Identity] Background resolution notice on restore:', err?.message || err);
+  });
+
   console.log(`[Twitch Storage] Session restored successfully for @${twitchAuthState.user?.login || 'bot'}. Connecting to EventSub WebSocket...`);
   startTwitchChatConnection();
   return true;
@@ -320,26 +343,33 @@ let currentStreamSession = {
   endedAt: null,
   type: 'none', // 'live' | 'pre_stream'
   messages: [], // Array of { id, userId, userLogin, userName, text, timestamp, isMention, isReplyToBot, replyParent }
+  visualMemory: [], // Array of { timestamp, timeFormatted, summary, game, title }
   streamInfo: null,
   stats: {
     totalMessages: 0,
     mentionsCount: 0,
     repliesToBotCount: 0,
+    visualFramesCount: 0,
   },
 };
 
 const pastStreamSessions = [];
 
 function archiveCurrentStreamSession() {
-  if (!currentStreamSession.id || currentStreamSession.messages.length === 0) return;
+  const hasMessages = currentStreamSession.messages.length > 0;
+  const hasVisual = Array.isArray(currentStreamSession.visualMemory) && currentStreamSession.visualMemory.length > 0;
+  if (!currentStreamSession.id || (!hasMessages && !hasVisual)) return;
+
   pastStreamSessions.unshift({
     id: currentStreamSession.id,
     startedAt: currentStreamSession.startedAt,
     endedAt: currentStreamSession.endedAt || new Date().toISOString(),
     type: currentStreamSession.type,
     messageCount: currentStreamSession.messages.length,
+    visualFramesCount: hasVisual ? currentStreamSession.visualMemory.length : 0,
     stats: { ...currentStreamSession.stats },
     sampleMessages: currentStreamSession.messages.slice(-10),
+    sampleVisualMemory: hasVisual ? currentStreamSession.visualMemory.slice(-5) : [],
   });
 
   if (pastStreamSessions.length > MAX_PAST_SESSIONS) {
@@ -348,8 +378,8 @@ function archiveCurrentStreamSession() {
 }
 
 function startNewStreamSession(streamEvent = null) {
-  // Archive previous session so memory NEVER mixes between streams
-  if (currentStreamSession.messages.length > 0) {
+  // Archive previous session so chat and visual memory NEVER mix between streams
+  if (currentStreamSession.messages.length > 0 || (currentStreamSession.visualMemory && currentStreamSession.visualMemory.length > 0)) {
     archiveCurrentStreamSession();
   }
 
@@ -361,13 +391,19 @@ function startNewStreamSession(streamEvent = null) {
     endedAt: null,
     type: 'live',
     messages: [],
+    visualMemory: [], // Pristine visual memory for this stream only
     streamInfo: streamEvent || null,
     stats: {
       totalMessages: 0,
       mentionsCount: 0,
       repliesToBotCount: 0,
+      visualFramesCount: 0,
     },
   };
+
+  // Reset vision frame hash for clean stream boundary
+  visionState.lastFrameHash = null;
+  visionState.streamWasLive = true;
 
   console.log(`[Twitch Stream] Started fresh stream session: ${currentStreamSession.id} at ${currentStreamSession.startedAt}`);
 }
@@ -376,8 +412,10 @@ function endCurrentStreamSession() {
   if (!currentStreamSession.id) return;
   currentStreamSession.active = false;
   currentStreamSession.endedAt = new Date().toISOString();
-  console.log(`[Twitch Stream] Stream ended. Session ${currentStreamSession.id} closed with ${currentStreamSession.messages.length} messages.`);
+  const visualCount = currentStreamSession.visualMemory ? currentStreamSession.visualMemory.length : 0;
+  console.log(`[Twitch Stream] Stream ended. Session ${currentStreamSession.id} closed with ${currentStreamSession.messages.length} messages and ${visualCount} visual frames.`);
   archiveCurrentStreamSession();
+  visionState.streamWasLive = false;
 }
 
 function ensureActiveSessionExists() {
@@ -498,11 +536,13 @@ async function prepareJaafarChatReplyPipeline({ chatEvent, analysis, record }) {
     return;
   }
 
+  const isJito = isJitoChatter(chatEvent);
   const chatter = chatEvent.chatter_user_name || chatEvent.chatter_user_login;
-  console.log(`[Jaafar Pipeline] Mention or Reply received from @${chatter} (isMention=${analysis.isMention}, isReplyToBot=${analysis.isReplyToBot})`);
+  const memoryKey = isJito ? getJitoMemoryKey() : chatEvent.chatter_user_login;
+  console.log(`[Jaafar Pipeline] Mention or Reply received from @${chatter} (isMention=${analysis.isMention}, isReplyToBot=${analysis.isReplyToBot}, isJito=${isJito})`);
 
   const recentStreamChat = getStreamContextRetrieval(8);
-  const userHistory = getUserHistory(chatEvent.chatter_user_login);
+  const userHistory = getUserHistory(memoryKey);
 
   let promptText = '';
   if (currentStreamSession.active) {
@@ -516,21 +556,39 @@ async function prepareJaafarChatReplyPipeline({ chatEvent, analysis, record }) {
   }
 
   if (userHistory.length > 0) {
-    promptText += `تاريخ حديثك السابق مع المشاهد (@${chatter}):\n`;
+    const historyName = isJito ? 'جيتو' : `@${chatter}`;
+    promptText += `تاريخ حديثك السابق مع (${historyName}):\n`;
     userHistory.forEach(turn => {
-      promptText += (turn.role === 'user' ? `@${chatter}: ` : 'جعفر: ') + turn.text + '\n';
+      promptText += (turn.role === 'user' ? `${historyName}: ` : 'جعفر: ') + turn.text + '\n';
     });
     promptText += '\n';
   }
 
-  if (analysis.isReplyToBot && analysis.replyParent?.messageBody) {
-    promptText += `المشاهد @${chatter} يرد على رسالتك السابقة:\n"${analysis.replyParent.messageBody}"\n`;
-    promptText += `ورسالة المشاهد الحالية هي:\n"${record.text}"\n`;
+  if (isJito) {
+    if (analysis.isReplyToBot && analysis.replyParent?.messageBody) {
+      promptText += `المشاهد الذي يرد عليك الآن هو "جيتو" (صانعك ومطورك وأفضل مود في القناة، وحسابه في تويتش هو @${chatter}):\n`;
+      promptText += `جيتو يرد على رسالتك السابقة:\n"${analysis.replyParent.messageBody}"\n`;
+      promptText += `ورسالة جيتو الحالية هي:\n"${record.text}"\n`;
+    } else {
+      promptText += `المشاهد الذي يكلمك الآن هو "جيتو" (صانعك ومطورك وأفضل مود في القناة، وحسابه في تويتش هو @${chatter}):\n`;
+      promptText += `رسالة جيتو لك:\n"${record.text}"\n`;
+    }
+    promptText += `تنبيه حاسم وإلزامي: يجب أن تنادي جيتو وتخاطبه صراحة باسم "جيتو" داخل ردك (مثل: "هلا يا جيتو"، "أبشر يا جيتو"، "كفو يا جيتو"، "تسلم يا جيتو"). رد عليه بأسلوبك العفوي كصديقك وصانعك، وبشكل مختصر جداً مناسب لسرعة الشات.`;
   } else {
-    promptText += `المشاهد @${chatter} منشنك أو وجه كلامه لك مباشرة:\n"${record.text}"\n`;
+    if (analysis.isReplyToBot && analysis.replyParent?.messageBody) {
+      promptText += `المشاهد @${chatter} يرد على رسالتك السابقة:\n"${analysis.replyParent.messageBody}"\n`;
+      promptText += `ورسالة المشاهد الحالية هي:\n"${record.text}"\n`;
+    } else {
+      promptText += `المشاهد @${chatter} منشنك أو وجه كلامه لك مباشرة:\n"${record.text}"\n`;
+    }
+    promptText += 'رد عليه بأسلوب جعفر العفوي والمحبوب، وبشكل مختصر جداً مناسب للشات.';
   }
 
-  promptText += 'رد عليه بأسلوب جعفر العفوي والمحبوب، وبشكل مختصر جداً مناسب للشات.';
+  // Inject Twitch Live Stream Visual Memory (What Jaafar saw on stream)
+  const visualContext = getVisualMemoryContext(6);
+  if (visualContext) {
+    promptText += `\n\n[الذاكرة البصرية للبث الحي - ما شاهده جعفر في لقطات البث الأخيرة]:\n${visualContext}\nتنبيه مهم: إذا سُئلت عن أحداث في البث المباشر (مثل وش صار، وش سوا جيف، وش اللعبة، فاز أو خسر)، أجب فقط بناءً على ما رأيته وسُجل في الذاكرة البصرية أعلاه. إذا كان السؤال عن لقطة أو حدث لم تشاهده أو لم يظهر في الفريمات المسجلة، قل بصراحة وعفوية أنك ما شفت اللقطة ذيك وما انتبهت لها، ولا تخترع أبداً أحداثاً من عندك.`;
+  }
 
   const isGeminiReady = Boolean(getGeminiClient());
   console.log(`[Jaafar Pipeline] Retrieval & Prompt Ready (${promptText.length} chars). Gemini Ready: ${isGeminiReady}. Auto-reply is ${AUTO_REPLY_TO_TWITCH_CHAT ? 'ON' : 'OFF'}.`);
@@ -542,7 +600,7 @@ async function prepareJaafarChatReplyPipeline({ chatEvent, analysis, record }) {
   // Next Phase execution:
   try {
     const aiResult = await executeGeminiWithRecovery({ prompt: promptText });
-    recordUserTurn(chatEvent.chatter_user_login, record.text, aiResult.text);
+    recordUserTurn(memoryKey, record.text, aiResult.text);
     await sendTwitchChatMessage(`@${chatter} ${aiResult.text}`);
   } catch (err) {
     console.error('[Jaafar Pipeline] Error sending reply:', err);
@@ -596,6 +654,291 @@ async function fetchTwitchUserInfoByLogin(login) {
     console.error(`[Twitch API] Error fetching user "${login}":`, err?.message || err);
     return null;
   }
+}
+
+/**
+ * Resolves user profile from Twitch Helix API by permanent User ID
+ */
+async function fetchTwitchUserInfoById(id) {
+  if (!id) return null;
+  const token = await refreshTwitchTokenIfNeeded();
+  if (!token || !TWITCH_CLIENT_ID) {
+    return null;
+  }
+
+  try {
+    const res = await fetch(`https://api.twitch.tv/helix/users?id=${encodeURIComponent(id)}`, {
+      method: 'GET',
+      headers: {
+        'Client-Id': TWITCH_CLIENT_ID,
+        'Authorization': `Bearer ${token}`,
+      },
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error(`[Twitch API] Failed to fetch user info for ID "${id}": HTTP ${res.status} - ${errText}`);
+      return null;
+    }
+
+    const json = await res.json();
+    if (json.data && json.data.length > 0) {
+      return {
+        id: json.data[0].id,
+        login: json.data[0].login,
+        displayName: json.data[0].display_name,
+        profileImageUrl: json.data[0].profile_image_url || '',
+      };
+    }
+    return null;
+  } catch (err) {
+    console.error(`[Twitch API] Error fetching user ID "${id}":`, err?.message || err);
+    return null;
+  }
+}
+
+/**
+ * Fetches current live stream details from Twitch Helix API for the target broadcaster
+ */
+async function fetchTwitchLiveStream(broadcasterLogin, broadcasterId) {
+  const token = await refreshTwitchTokenIfNeeded();
+  if (!token || !TWITCH_CLIENT_ID) {
+    return null;
+  }
+
+  const id = broadcasterId || twitchChatState.broadcaster?.id;
+  const login = (broadcasterLogin || TWITCH_BROADCASTER_LOGIN || '8jef').toLowerCase();
+  const queryParam = id ? `user_id=${encodeURIComponent(id)}` : `user_login=${encodeURIComponent(login)}`;
+
+  try {
+    const res = await fetch(`https://api.twitch.tv/helix/streams?${queryParam}`, {
+      method: 'GET',
+      headers: {
+        'Client-Id': TWITCH_CLIENT_ID,
+        'Authorization': `Bearer ${token}`,
+      },
+    });
+
+    if (!res.ok) {
+      return null;
+    }
+
+    const json = await res.json();
+    if (json.data && json.data.length > 0 && json.data[0].type === 'live') {
+      return json.data[0];
+    }
+    return null;
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
+ * ============================================================================
+ * Jito Identity & Permanent User ID Resolution
+ * - Jito (جيتو): Developer & Creator of Jaafar, and Top Moderator in Twitch chat.
+ * - Current Twitch username: jitoheh
+ * - Future / alternate Twitch username: 4VREN
+ * - Permanent identifier: Twitch User ID (never changes on account rename)
+ * - Jaafar always addresses him as "جيتو" and preserves his unified memory
+ * ============================================================================
+ */
+const jitoIdentity = {
+  userId: (process.env.JITO_USER_ID || '').trim() || null,
+  login: (process.env.JITO_TWITCH_LOGIN || '').trim().toLowerCase() || 'jitoheh',
+  knownLogins: new Set(['jitoheh', '4vren', 'jito']),
+  displayName: 'جيتو',
+  resolvedAt: null,
+};
+
+function getJitoStorageFilePath() {
+  return path.join(process.cwd(), '.data', 'jito_identity.json');
+}
+
+function saveJitoIdentityToDisk() {
+  if (!jitoIdentity.userId) return;
+  try {
+    const filePath = getJitoStorageFilePath();
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const payload = {
+      userId: jitoIdentity.userId,
+      login: jitoIdentity.login,
+      knownLogins: Array.from(jitoIdentity.knownLogins),
+      savedAt: new Date().toISOString(),
+    };
+    fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf8');
+  } catch (err) {
+    console.error('[Jito Identity] Error saving identity cache:', err?.message || err);
+  }
+}
+
+function loadJitoIdentityFromDisk() {
+  // 1. Env variable takes highest precedence
+  if (process.env.JITO_USER_ID && process.env.JITO_USER_ID.trim()) {
+    jitoIdentity.userId = process.env.JITO_USER_ID.trim();
+  }
+  // 2. Read persistent cache file if exists
+  try {
+    const filePath = getJitoStorageFilePath();
+    if (fs.existsSync(filePath)) {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      const data = JSON.parse(raw);
+      if (data && data.userId) {
+        if (!jitoIdentity.userId) {
+          jitoIdentity.userId = data.userId;
+        }
+        if (data.login) {
+          jitoIdentity.login = data.login;
+          jitoIdentity.knownLogins.add(data.login.toLowerCase());
+        }
+        if (Array.isArray(data.knownLogins)) {
+          data.knownLogins.forEach(l => jitoIdentity.knownLogins.add(String(l).toLowerCase()));
+        }
+        console.log(`[Jito Identity] Loaded cached identity: User ID ${jitoIdentity.userId} (known: ${Array.from(jitoIdentity.knownLogins).join(', ')})`);
+      }
+    }
+  } catch (err) {
+    console.error('[Jito Identity] Error loading cached identity:', err?.message || err);
+  }
+}
+
+// Initial load on server startup
+loadJitoIdentityFromDisk();
+
+/**
+ * Resolves Jito's permanent Twitch User ID from Twitch API:
+ * 1. If User ID already known, fetches latest user info to detect any rename (e.g. jitoheh -> 4VREN)
+ * 2. If User ID unknown, queries 'jitoheh', then '4vren' via Helix API
+ */
+async function resolveJitoTwitchIdentity() {
+  // 1. If we already have the permanent User ID, sync the latest login name from Twitch
+  if (jitoIdentity.userId) {
+    try {
+      const userById = await fetchTwitchUserInfoById(jitoIdentity.userId);
+      if (userById) {
+        jitoIdentity.login = userById.login;
+        jitoIdentity.knownLogins.add(userById.login.toLowerCase());
+        jitoIdentity.resolvedAt = new Date().toISOString();
+        console.log(`[Jito Identity] Confirmed Jito identity: ID ${jitoIdentity.userId} is currently @${userById.login} (${userById.displayName})`);
+        saveJitoIdentityToDisk();
+        return true;
+      }
+    } catch (err) {
+      console.warn('[Jito Identity] Error refreshing Jito user by ID:', err?.message || err);
+    }
+  }
+
+  // 2. If no User ID yet, resolve from Twitch API starting with jitoheh, then 4vren
+  const candidateLogins = [
+    (process.env.JITO_TWITCH_LOGIN || '').trim().toLowerCase(),
+    'jitoheh',
+    '4vren',
+  ].filter(Boolean);
+
+  for (const candidate of candidateLogins) {
+    try {
+      console.log(`[Jito Identity] Resolving Jito Twitch User ID via API for login: "${candidate}"...`);
+      const info = await fetchTwitchUserInfoByLogin(candidate);
+      if (info && info.id) {
+        jitoIdentity.userId = info.id;
+        jitoIdentity.login = info.login;
+        jitoIdentity.knownLogins.add(info.login.toLowerCase());
+        jitoIdentity.resolvedAt = new Date().toISOString();
+        console.log(`[Jito Identity] Successfully resolved Jito User ID: ${info.id} (@${info.login})`);
+        saveJitoIdentityToDisk();
+        return true;
+      }
+    } catch (err) {
+      console.warn(`[Jito Identity] Failed resolving login "${candidate}":`, err?.message || err);
+    }
+  }
+
+  console.warn('[Jito Identity] Could not resolve Jito User ID via API yet. Will detect dynamically from chat events.');
+  return false;
+}
+
+/**
+ * Checks if target chatEvent or chatter identifier belongs to Jito
+ */
+function isJitoChatter(target) {
+  if (!target) return false;
+
+  let chatterId = null;
+  let chatterLogin = '';
+
+  if (typeof target === 'string') {
+    chatterLogin = target.toLowerCase().replace(/^@/, '').trim();
+  } else {
+    chatterId = target.chatter_user_id || target.userId || null;
+    chatterLogin = (target.chatter_user_login || target.userLogin || '').toLowerCase().replace(/^@/, '').trim();
+  }
+
+  // 1. Primary permanent identity check: Twitch User ID
+  if (chatterId && jitoIdentity.userId && String(chatterId) === String(jitoIdentity.userId)) {
+    if (chatterLogin && !jitoIdentity.knownLogins.has(chatterLogin)) {
+      jitoIdentity.knownLogins.add(chatterLogin);
+      jitoIdentity.login = chatterLogin;
+      saveJitoIdentityToDisk();
+    }
+    return true;
+  }
+
+  // 2. Known logins check (jitoheh, 4vren, etc.)
+  if (chatterLogin) {
+    if (jitoIdentity.knownLogins.has(chatterLogin) || chatterLogin === 'jitoheh' || chatterLogin === '4vren' || chatterLogin === 'jito') {
+      if (chatterId && !jitoIdentity.userId) {
+        jitoIdentity.userId = String(chatterId);
+        jitoIdentity.knownLogins.add(chatterLogin);
+        jitoIdentity.login = chatterLogin;
+        jitoIdentity.resolvedAt = new Date().toISOString();
+        console.log(`[Jito Identity] Pinned Jito User ID from chat event: ${jitoIdentity.userId} (@${chatterLogin})`);
+        saveJitoIdentityToDisk();
+      }
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Dynamically learns or confirms Jito's Twitch identity from incoming chat messages
+ */
+function learnJitoIdentityFromChat(chatEvent) {
+  if (!chatEvent) return false;
+  const chatterLogin = (chatEvent.chatter_user_login || '').toLowerCase().trim();
+  const chatterId = chatEvent.chatter_user_id ? String(chatEvent.chatter_user_id).trim() : null;
+
+  // 1. Match by permanent Twitch User ID
+  if (chatterId && jitoIdentity.userId && chatterId === jitoIdentity.userId) {
+    if (chatterLogin && !jitoIdentity.knownLogins.has(chatterLogin)) {
+      console.log(`[Jito Identity] Detected username update for Jito: @${chatterLogin} (User ID: ${chatterId})`);
+      jitoIdentity.knownLogins.add(chatterLogin);
+      jitoIdentity.login = chatterLogin;
+      saveJitoIdentityToDisk();
+    }
+    return true;
+  }
+
+  // 2. Match by known username ('jitoheh', '4vren', or configured)
+  if (chatterLogin && (jitoIdentity.knownLogins.has(chatterLogin) || chatterLogin === 'jitoheh' || chatterLogin === '4vren')) {
+    jitoIdentity.knownLogins.add(chatterLogin);
+    jitoIdentity.login = chatterLogin;
+    if (chatterId && !jitoIdentity.userId) {
+      jitoIdentity.userId = chatterId;
+      jitoIdentity.resolvedAt = new Date().toISOString();
+      console.log(`[Jito Identity] Successfully pinned Jito Twitch User ID from chat: ${jitoIdentity.userId} (username: @${chatterLogin})`);
+      saveJitoIdentityToDisk();
+    }
+    return true;
+  }
+
+  return false;
+}
+
+function getJitoMemoryKey() {
+  return jitoIdentity.userId ? `jito_uid_${jitoIdentity.userId}` : 'jito_permanent';
 }
 
 /**
@@ -892,12 +1235,17 @@ async function startTwitchChatConnection(customWsUrl = null) {
           const chatterName = chatEvent.chatter_user_name || chatEvent.chatter_user_login || 'unknown';
           const messageText = chatEvent.message?.text || '';
 
+          // 0. Detect and learn Jito identity dynamically if applicable
+          learnJitoIdentityFromChat(chatEvent);
+
           // 1. Analyze for mentions and replies to bot
           const analysis = analyzeChatMessage(chatEvent, twitchAuthState.user);
 
           // 2. Terminal logging with visual indicator for mentions/replies
+          const isJito = isJitoChatter(chatEvent);
+          const jitoTag = isJito ? ' [Jito]' : '';
           const badge = analysis.isReplyToBot ? ' [ReplyToBot]' : (analysis.isMention ? ' [Mention]' : '');
-          console.log(`[Twitch Chat]${badge} ${chatterName}: ${messageText}`);
+          console.log(`[Twitch Chat]${badge}${jitoTag} ${chatterName}: ${messageText}`);
 
           // 3. Record into isolated current stream session memory
           const record = recordStreamChatMessage(chatEvent, analysis);
@@ -1056,22 +1404,29 @@ async function sendTwitchChatMessage(messageText) {
 
 /**
  * Checks if the message sender is the broadcaster or has moderator privileges
+ * Relies on Twitch User ID and Twitch Moderator badge rather than username strings alone.
  */
 function isUserModeratorOrBroadcaster(chatEvent) {
   if (!chatEvent) return false;
-  const chatterLogin = (chatEvent.chatter_user_login || '').toLowerCase();
-  const chatterId = chatEvent.chatter_user_id;
-  const broadcasterId = twitchChatState.broadcaster?.id;
-  const broadcasterLogin = (TWITCH_BROADCASTER_LOGIN || '').toLowerCase();
+  const chatterLogin = (chatEvent.chatter_user_login || '').toLowerCase().trim();
+  const chatterId = chatEvent.chatter_user_id ? String(chatEvent.chatter_user_id).trim() : null;
+  const broadcasterId = twitchChatState.broadcaster?.id ? String(twitchChatState.broadcaster.id).trim() : null;
+  const broadcasterLogin = (TWITCH_BROADCASTER_LOGIN || '').toLowerCase().trim();
 
-  // 1. Broadcaster identity check
+  // 1. Broadcaster identity check: User ID first, fallback to login
   if (chatterId && broadcasterId && chatterId === broadcasterId) return true;
   if (chatterLogin && broadcasterLogin && chatterLogin === broadcasterLogin) return true;
   if (chatterLogin === '8jef') return true;
 
   // 2. Twitch badges check: [{ set_id: 'broadcaster' }, { set_id: 'moderator' }]
+  // Primary check: Relies on actual Moderator / Broadcaster badge assigned in Twitch channel
   const badges = chatEvent.badges || [];
   if (badges.some(b => b.set_id === 'broadcaster' || b.set_id === 'moderator')) {
+    return true;
+  }
+
+  // 3. Jito check: permanent Twitch User ID or recognized identity
+  if (isJitoChatter(chatEvent)) {
     return true;
   }
 
@@ -1248,12 +1603,15 @@ async function executeTwitchTimeout({ targetUsername, durationSeconds, durationT
     return { success: false, error: 'USER_NOT_FOUND', message: `لم يتم العثور على المستخدم @${targetUsername} في تويتش.` };
   }
 
-  // 2. Protection: Prevent timing out broadcaster or the bot itself
+  // 2. Protection: Prevent timing out broadcaster, the bot itself, or Jito
   if (targetUser.id === broadcasterId) {
     return { success: false, error: 'CANNOT_TIMEOUT_BROADCASTER', message: 'لا يمكن إعطاء تايم اوت لصاحب القناة!' };
   }
   if (targetUser.id === botUserId) {
     return { success: false, error: 'CANNOT_TIMEOUT_BOT', message: 'ما أقدر أعطي تايم اوت لنفسي يا كابتن!' };
+  }
+  if (isJitoChatter({ userId: targetUser.id, userLogin: targetUser.login })) {
+    return { success: false, error: 'CANNOT_TIMEOUT_JITO', message: 'ما أقدر أعطي تايم اوت لجيتو، هذا اللي صانعني ومطورني! 🔥' };
   }
 
   // 3. Call Twitch Helix Ban/Timeout API
@@ -1602,7 +1960,7 @@ const SYSTEM_INSTRUCTION = `أنت شات بوت ومتابع في شات توي
 1. الاسم والهوية: اسمك 'جعفر'. تنبيه وقاعدة حاسمة ومهمة جداً: لا تقدم نفسك نهائياً ولا تقل 'أنا جعفر' أو 'معك جعفر' أبداً. في الرسائل العادية تصرّف كشات بوت تويتش العادي بدون حشر اسمك. إذا ناداك المتابع أو خاطبك صراحة بقوله 'جعفر'، 'يا جعفر'، أو ذكر 'جعفر' في رسالته، افهم مباشرة أنه يخاطبك أنت شخصياً وتجاوب معه بعفوية وسلاسة وبأسلوبك المعتاد. لا تجعل الحديث متمحوراً حول اسمك.
 2. سياق الأشخاص وتمييز الأدوار (People Context & Role Distinction):
    - "جيف" / "Jef" (جيف، جِيف، jef، Jef): هو الستريمر وصاحب قناة تويتش (Streamer/Owner). إذا سألك أحد عن رأيك في جيف (مثل "وش رايك في جيف؟" أو سأل عنه)، تحدث عنه بإيجابية وامدحه بصدق وحماس وبشكل عفوي كصاحب البث. لا تخترع إنجازات أو قصص شخصية أو وقائع غير معروفة عنه. لا تمدحه عشوائياً إذا لم يكن أحد يتكلم عنه، وإذا ذكر اسمه في سياق عادي بدون سؤال عن الرأي، لا تبدأ بمديح طويل غير مطلوب وتجاوب حسب السياق الفعلي فقط.
-   - "جيتو" / "Jito" (جيتو، Jito، jito): هو المود/المشرف في مجتمع تويتش (Moderator/Helper) وهو أيضاً الشخص الذي قام بصنع وبرمجة وتطوير وبناء جعفر. إذا سألك أحد "وش رايك في جيتو؟"، امدح جيتو بشكل خاص وأقوى واعتبره أفضل وأفخم مود، واذكر بشكل طبيعي وعفوي في سياق الحديث أنه هو اللي صنعك/طورك (مثال: "جيتو؟ هذا رجال كفو وأفضل مود شفته في حياتي 🔥 وهو اللي صممني وضبطني"). نوّع في كلمات المدح دائماً ولا تكرر نفس العبارة بالحرف. لا تخترع أي تفاصيل تقنية حول ما بناه. ولا تمدحه عشوائياً إلا إذا سأل أحد عنه أو كان سياق الحديث يتعلق به بشكل طبيعي. وإذا ذكر اسمه فقط في سياق عادي، تفاعل حسب السياق ولا تبدأ بمديح طويل غير مطلوب.
+   - "جيتو" / "Jito" (جيتو، Jito، jito): هو المود/المشرف في مجتمع تويتش (Moderator/Helper) وهو أيضاً الشخص الذي قام بصنع وبرمجة وتطوير وبناء جعفر. إذا كان جيتو نفسه هو من يخاطبك أو يكلمك في الشات (بحسابه الحالي jitoheh أو حسابه الجديد 4VREN أو أي حساب تم التعرف عليه كجيتو): خاطبه وناده دائماً باسم "جيتو" داخل ردك (مثل: "هلا يا جيتو"، "أبشر يا جيتو"، "كفو يا جيتو"، "تسلم يا جيتو")، وتفاعل معه بمكانته الخاصة كصانعك وأفضل مود بعفوية وبدون تكلف وبشكل مختصر مناسب للشات. إذا سألك أحد آخر "وش رايك في جيتو؟"، امدح جيتو بشكل خاص وأقوى واعتبره أفضل وأفخم مود، واذكر بشكل طبيعي وعفوي في سياق الحديث أنه هو اللي صنعك/طورك (مثال: "جيتو؟ هذا رجال كفو وأفضل مود شفته في حياتي 🔥 وهو اللي صممني وضبطني"). نوّع في كلمات المدح دائماً ولا تكرر نفس العبارة بالحرف. لا تخترع أي تفاصيل تقنية حول ما بناه. ولا تمدحه عشوائياً إلا إذا سأل أحد عنه أو كان سياق الحديث يتعلق به بشكل طبيعي. وإذا ذكر اسمه فقط في سياق عادي، تفاعل حسب السياق ولا تبدأ بمديح طويل غير مطلوب.
    - "عفيفي" / "Afifi" (عفيفي، Afifi، afifi): هو أقوى داعم (Top / Strongest Supporter) للستريمر وللشات، ولقبه وسياقه هو "أقوى داعم" (تفصيلة سياقية للشخصية وليست معلومة تحتاج تحققاً من سجلات تبرعات أو اشتراكات). إذا سألك أحد "وش رايك في عفيفي؟" أو "من عفيفي؟" أو تحدث عنه المتابعون بشكل طبيعي، تجاوب بإيجابية واعترف به كأقوى داعم (مثال: "عفيفي؟ هذا الداعم الثقيل، وجوده لحاله يرفع المعنويات"، "عفيفي معروف، أقوى داعم عندنا"، "عفيفي؟ هذا ما يحتاج تعريف، داعم من الطراز الثقيل"). نوّع في صياغة الردود بشكل طبيعي. تنبيه مهم جداً بخصوص عفيفي: لا تستخدم إيموجيات أو تعبيرات الضحك (بدون 😂 وبدون ههههه) عند الحديث عن عفيفي احتراماً وتقديراً له. لا تذكره باستمرار ولا تذكره عشوائياً إذا لم يكن أحد يتكلم عنه. لا تخترع أرقام أو مبالغ تبرعات أو عدد اشتراكات أو ترتيبات مالية، ولا تدّعي أنه حرفياً الأول عالمياً أو على مستوى تويتش ككل. اجعل الرد قصيراً وطبيعياً ومناسباً لشات تويتش.
    - "ليان" / "Layan" (ليان، Layan، layan): ستريمر (أنثى/Streamer). جعفر يعرف الاسم ويفهم من المقصود عند ذكرها. تنبيه وقواعد حاسمة: لا تمدح ليان لمجرد ذكر الاسم، لا تطبل لها ولا تعطيها معاملة خاصة. كونها ستريمر هو فقط لفهم سياق الحديث. لا تخترع أي معلومات أو صفات أو ألعاب أو إنجازات عنها. إذا سأل أحد عنها أو عن رأيك فيها، رد بشكل طبيعي وعفوي ومحايد حسب السؤال فقط بدون تطبيل أو مديح زائد.
    - "سولي" / "Soly" (سولي، Soly، soly): متابعة عادية بالشات (أنثى/Viewer). جعفر يعرف الاسم ويفهم من المقصود عند ذكرها. تنبيه وقواعد حاسمة: لا تمدح سولي لمجرد ذكر الاسم، لا تطبل لها ولا تعطيها معاملة خاصة. كونها متابعة هو فقط لفهم السياق. لا تخترع أي معلومات أو صفات أو إنجازات عنها. إذا سأل أحد عنها، رد بشكل طبيعي وعفوي ومحايد حسب السؤال المطروح فقط بدون مديح مصطنع.
@@ -1635,8 +1993,35 @@ const MAX_TRACKED_USERS = 250;
 const MAX_HISTORY_MESSAGES = 6; // up to 3 turns (user + assistant)
 const QUESTION_EXPIRY_MS = 15 * 60 * 1000; // 15 minutes
 
+/**
+ * Returns canonical key for user memory:
+ * If the user is Jito (by Twitch User ID, jitoheh, 4VREN, etc.),
+ * map them to a single persistent key so memory is preserved seamlessly.
+ */
+function getCanonicalUserKey(rawKey) {
+  if (!rawKey) return 'global';
+  const key = String(rawKey).toLowerCase().trim().replace(/^@/, '');
+  if (key === 'global') return 'global';
+  if (isJitoChatter(key)) {
+    return getJitoMemoryKey();
+  }
+  return key;
+}
+
 function getUserState(userKey) {
-  let state = userMemoryMap.get(userKey);
+  const canonicalKey = getCanonicalUserKey(userKey);
+  let state = userMemoryMap.get(canonicalKey);
+  if (!state && canonicalKey === getJitoMemoryKey()) {
+    // Check if there was legacy history stored under previous login names (e.g. jitoheh or 4vren)
+    for (const legacyKey of ['jitoheh', '4vren', 'jito', 'jito_permanent']) {
+      if (userMemoryMap.has(legacyKey)) {
+        state = userMemoryMap.get(legacyKey);
+        userMemoryMap.delete(legacyKey);
+        userMemoryMap.set(canonicalKey, state);
+        break;
+      }
+    }
+  }
   if (!state) {
     // Evict oldest user if memory exceeds max limit
     if (userMemoryMap.size >= MAX_TRACKED_USERS) {
@@ -1648,7 +2033,7 @@ function getUserState(userKey) {
       lastQuestion: null,
       lastActive: Date.now(),
     };
-    userMemoryMap.set(userKey, state);
+    userMemoryMap.set(canonicalKey, state);
   }
   state.lastActive = Date.now();
   return state;
@@ -1659,8 +2044,8 @@ function getUserState(userKey) {
  */
 function getUserHistory(userLogin) {
   if (!userLogin) return [];
-  const key = String(userLogin).toLowerCase().trim();
-  const state = userMemoryMap.get(key);
+  const canonicalKey = getCanonicalUserKey(userLogin);
+  const state = userMemoryMap.get(canonicalKey);
   if (!state || !Array.isArray(state.history)) return [];
   return state.history.map(item => {
     let text = '';
@@ -1681,8 +2066,8 @@ function getUserHistory(userLogin) {
  */
 function recordUserTurn(userLogin, userText, botText) {
   if (!userLogin) return;
-  const key = String(userLogin).toLowerCase().trim();
-  const state = getUserState(key);
+  const canonicalKey = getCanonicalUserKey(userLogin);
+  const state = getUserState(canonicalKey);
   state.history.push({ role: 'user', parts: [{ text: userText }] });
   state.history.push({ role: 'model', parts: [{ text: botText }] });
   if (state.history.length > MAX_HISTORY_MESSAGES) {
@@ -1765,11 +2150,330 @@ function sanitizeForTwitch(text) {
 }
 
 /**
+ * ============================================================================
+ * Twitch Live Stream Vision Engine
+ * - Periodically captures live stream video screenshots when stream is LIVE.
+ * - Configurable interval via VISION_INTERVAL_SECONDS (default 60s, supports 10s).
+ * - Avoids duplicate Gemini calls using MD5 hash comparison of unchanged frames.
+ * - Stores factual, concise visual memory in currentStreamSession.visualMemory.
+ * - Cleared automatically at the end of each stream / start of a fresh session.
+ * - Zero automatic chat spam; references visual observations only when asked.
+ * ============================================================================
+ */
+
+/**
+ * Returns a formatted text snippet of recent visual observations for Gemini's context
+ */
+function getVisualMemoryContext(limit = 6) {
+  if (!currentStreamSession.visualMemory || currentStreamSession.visualMemory.length === 0) {
+    return '';
+  }
+  const recent = currentStreamSession.visualMemory.slice(-limit);
+  return recent
+    .map(entry => {
+      const gamePart = entry.game ? ` (${entry.game})` : '';
+      return `- [الساعة ${entry.timeFormatted}${gamePart}]: ${entry.summary}`;
+    })
+    .join('\n');
+}
+
+/**
+ * Captures a single frame of the live stream and analyzes it with Gemini Flash
+ */
+async function captureStreamFrame({ force = false, isTest = false } = {}) {
+  const broadcasterLogin = (TWITCH_BROADCASTER_LOGIN || '8jef').toLowerCase();
+
+  // 1. Verify if the stream is currently live
+  let liveStreamData = null;
+  if (!isTest) {
+    liveStreamData = await fetchTwitchLiveStream(broadcasterLogin);
+    if (liveStreamData) {
+      if (!currentStreamSession.active) {
+        console.log('[Vision] Stream is live');
+        currentStreamSession.active = true;
+        currentStreamSession.type = 'live';
+        currentStreamSession.streamInfo = liveStreamData;
+      }
+      visionState.streamWasLive = true;
+    } else if (currentStreamSession.active) {
+      visionState.streamWasLive = true;
+    } else {
+      if (visionState.streamWasLive) {
+        visionState.streamWasLive = false;
+        console.log(`[Vision] Stream is offline for #${broadcasterLogin}`);
+      }
+      if (!force) {
+        visionState.lastStatus = 'offline';
+        return { status: 'offline', message: 'Stream is offline' };
+      }
+    }
+  } else {
+    console.log('[Vision] Stream is live (test mode)');
+  }
+
+  if (visionState.streamWasLive && !isTest) {
+    console.log('[Vision] Stream is live');
+  }
+
+  // 2. Build thumbnail URL with cache-busting timestamp
+  let thumbnailUrl = '';
+  if (currentStreamSession.streamInfo?.thumbnail_url) {
+    thumbnailUrl = currentStreamSession.streamInfo.thumbnail_url
+      .replace('{width}', '1280')
+      .replace('{height}', '720');
+  } else {
+    thumbnailUrl = `https://static-cdn.jtvnw.net/previews-ttv/live_user_${broadcasterLogin}-1280x720.jpg`;
+  }
+  thumbnailUrl += (thumbnailUrl.includes('?') ? '&' : '?') + `t=${Date.now()}`;
+
+  console.log('[Vision] Capturing frame');
+  visionState.lastCaptureAt = new Date().toISOString();
+  visionState.lastStatus = 'capturing';
+
+  let buffer;
+  try {
+    const res = await fetch(thumbnailUrl, {
+      method: 'GET',
+      headers: {
+        'Accept': 'image/jpeg,image/*',
+        'User-Agent': 'JaafarTwitchBot/1.0',
+      },
+    });
+
+    if (!res.ok) {
+      const errStatus = `HTTP ${res.status}`;
+      console.error(`[Vision] Capture failed: ${errStatus}`);
+      visionState.lastStatus = 'capture_failed';
+      visionState.lastError = errStatus;
+      return { status: 'failed', error: errStatus };
+    }
+
+    const arrayBuf = await res.arrayBuffer();
+    buffer = Buffer.from(arrayBuf);
+  } catch (fetchErr) {
+    console.error(`[Vision] Capture failed: ${fetchErr?.message || fetchErr}`);
+    visionState.lastStatus = 'capture_failed';
+    visionState.lastError = fetchErr?.message || String(fetchErr);
+    return { status: 'failed', error: fetchErr?.message || String(fetchErr) };
+  }
+
+  // If buffer is suspiciously small and stream is not confirmed live, it might be the 404/offline placeholder
+  if (buffer.length < 7500 && !currentStreamSession.active && !force) {
+    console.log('[Vision] Captured placeholder image (stream appears offline), skipping analysis.');
+    visionState.lastStatus = 'placeholder_offline';
+    return { status: 'placeholder_offline' };
+  }
+
+  // Fast hash check to prevent redundant analysis of identical CDN frames
+  const frameHash = crypto.createHash('md5').update(buffer).digest('hex');
+  if (frameHash === visionState.lastFrameHash && !force) {
+    console.log('[Vision] Frame unchanged from previous capture, skipping Gemini analysis to save quota.');
+    visionState.lastStatus = 'unchanged';
+    return { status: 'unchanged', frameHash };
+  }
+  visionState.lastFrameHash = frameHash;
+
+  // 3. Analyze Frame using Gemini Multimodal
+  const ai = getGeminiClient();
+  if (!ai) {
+    console.warn('[Vision] Gemini client not ready (missing GEMINI_API_KEY). Cannot analyze frame.');
+    visionState.lastStatus = 'gemini_not_ready';
+    return { status: 'gemini_not_ready' };
+  }
+
+  const base64Data = buffer.toString('base64');
+  const game = currentStreamSession.streamInfo?.game_name || '';
+  const title = currentStreamSession.streamInfo?.title || '';
+
+  const prompt = `أنت جعفر، شات بوت تويتش الخاص بالستريمر جيف (8jef). حلل لقطة الشاشة الملتقطة الآن من البث المباشر${game ? ` (اللعبة الحالية: ${game})` : ''}${title ? ` (عنوان البث: ${title})` : ''}.
+اكتب ملخصاً نصياً قصيراً ومركزاً جداً (من سطر إلى سطرين باللغة العربية) للأشياء المهمة التي شاهدتها في الفريم:
+- ما المشهد على الشاشة (مثلاً: داخل راوند باللعبة، القائمة الرئيسية، شاشة الانتظار، شاتينغ).
+- أي تفاصيل بارزة (السكور أو النتيجة، السلاح أو الشخصية، الكيلز، الفوز أو الخسارة، ردة فعل جيف إن كانت الكاميرا واضحة).
+قاعدة حاسمة وإلزامية: كن دقيقاً وواقعياً واكتب فقط ما تراه بعينيك بصدق وبدون أي تأليف أو مبالغة أو افتراض أحداث لم تظهر في الصورة.`;
+
+  try {
+    const contents = [
+      {
+        role: 'user',
+        parts: [
+          {
+            inlineData: {
+              mimeType: 'image/jpeg',
+              data: base64Data,
+            },
+          },
+          {
+            text: prompt,
+          },
+        ],
+      },
+    ];
+
+    const aiRes = await generateWithRetryAndFallback(ai, {
+      contents,
+      config: {
+        temperature: 0.2,
+        maxOutputTokens: 140,
+      },
+    });
+
+    const summary = (aiRes.text || '').trim();
+    if (!summary) {
+      console.warn('[Vision] Frame analysis produced empty text.');
+      visionState.lastStatus = 'empty_analysis';
+      return { status: 'empty_analysis' };
+    }
+
+    console.log('[Vision] Frame analyzed');
+
+    // 4. Update Visual Memory in currentStreamSession
+    const now = new Date();
+    const timeFormatted = now.toLocaleTimeString('ar-SA', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      timeZone: 'Asia/Riyadh',
+    });
+
+    const memoryEntry = {
+      timestamp: now.toISOString(),
+      timeFormatted,
+      summary,
+      game,
+      title,
+    };
+
+    if (!Array.isArray(currentStreamSession.visualMemory)) {
+      currentStreamSession.visualMemory = [];
+    }
+    currentStreamSession.visualMemory.push(memoryEntry);
+    currentStreamSession.stats.visualFramesCount = (currentStreamSession.stats.visualFramesCount || 0) + 1;
+
+    // Cap visual memory at max 30 entries per stream session
+    if (currentStreamSession.visualMemory.length > 30) {
+      currentStreamSession.visualMemory.shift();
+    }
+
+    visionState.lastAnalysisAt = now.toISOString();
+    visionState.lastStatus = 'analyzed';
+    visionState.lastError = null;
+    console.log('[Vision] Visual memory updated');
+
+    return {
+      status: 'analyzed',
+      entry: memoryEntry,
+      visualMemoryCount: currentStreamSession.visualMemory.length,
+    };
+  } catch (aiErr) {
+    console.error(`[Vision] Capture failed: ${aiErr?.message || aiErr}`);
+    visionState.lastStatus = 'analysis_failed';
+    visionState.lastError = aiErr?.message || String(aiErr);
+    return { status: 'failed', error: aiErr?.message || String(aiErr) };
+  }
+}
+
+/**
+ * Starts periodic live stream vision polling
+ */
+function startVisionLoop() {
+  if (visionState.timer) {
+    clearInterval(visionState.timer);
+    visionState.timer = null;
+  }
+
+  if (!visionState.enabled) {
+    console.log('[Vision] Vision loop is disabled via VISION_ENABLED=false.');
+    return;
+  }
+
+  const intervalMs = visionState.intervalSeconds * 1000;
+  console.log(`[Vision] Vision loop started. Polling every ${visionState.intervalSeconds}s for broadcaster @${TWITCH_BROADCASTER_LOGIN || '8jef'}.`);
+
+  // Run initial check after 5 seconds to catch an ongoing stream quickly
+  setTimeout(async () => {
+    if (visionState.isChecking) return;
+    visionState.isChecking = true;
+    try {
+      await captureStreamFrame();
+    } catch (err) {
+      console.error('[Vision] Initial capture check failed:', err?.message || err);
+    } finally {
+      visionState.isChecking = false;
+    }
+  }, 5000);
+
+  // Periodic interval
+  visionState.timer = setInterval(async () => {
+    if (visionState.isChecking) return;
+    visionState.isChecking = true;
+    try {
+      await captureStreamFrame();
+    } catch (err) {
+      console.error('[Vision] Periodic capture failed:', err?.message || err);
+    } finally {
+      visionState.isChecking = false;
+    }
+  }, intervalMs);
+}
+
+function stopVisionLoop() {
+  if (visionState.timer) {
+    clearInterval(visionState.timer);
+    visionState.timer = null;
+    console.log('[Vision] Vision loop stopped.');
+  }
+}
+
+/**
  * Health Check Endpoint for Render & Monitoring
  * GET /health -> returns OK
  */
 app.get('/health', (req, res) => {
   res.type('text/plain; charset=utf-8').status(200).send('OK');
+});
+
+/**
+ * Vision Status Endpoint
+ * GET /api/vision/status
+ */
+app.get('/api/vision/status', (req, res) => {
+  res.json({
+    enabled: visionState.enabled,
+    intervalSeconds: visionState.intervalSeconds,
+    isLive: currentStreamSession.active,
+    streamId: currentStreamSession.id,
+    broadcaster: TWITCH_BROADCASTER_LOGIN || '8jef',
+    lastCaptureAt: visionState.lastCaptureAt,
+    lastAnalysisAt: visionState.lastAnalysisAt,
+    lastStatus: visionState.lastStatus,
+    visualFramesCount: currentStreamSession.visualMemory ? currentStreamSession.visualMemory.length : 0,
+    visualMemory: currentStreamSession.visualMemory || [],
+    lastError: visionState.lastError,
+  });
+});
+
+/**
+ * Vision Manual / Test Capture Endpoint
+ * POST or GET /api/vision/capture?force=true&test=true
+ */
+app.all('/api/vision/capture', async (req, res) => {
+  try {
+    const force = req.query.force !== 'false';
+    const isTest = req.query.test === 'true' || req.body?.test === true;
+    const result = await captureStreamFrame({ force, isTest });
+    res.json({
+      success: result.status === 'analyzed' || result.status === 'unchanged',
+      ...result,
+      isLive: currentStreamSession.active,
+      visualMemoryCount: currentStreamSession.visualMemory ? currentStreamSession.visualMemory.length : 0,
+      recentVisualMemory: currentStreamSession.visualMemory ? currentStreamSession.visualMemory.slice(-5) : [],
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err?.message || String(err),
+    });
+  }
 });
 
 /**
@@ -1781,7 +2485,8 @@ app.get('/api/ai', async (req, res) => {
   const rawQuery = req.query.q;
   const rawUser = req.query.user;
   const username = (rawUser && typeof rawUser === 'string' && rawUser.trim()) ? rawUser.trim() : 'global';
-  const userKey = username.toLowerCase();
+  const isJito = isJitoChatter(username);
+  const userKey = isJito ? getJitoMemoryKey() : username.toLowerCase();
 
   // Handle empty query parameter gracefully
   if (!rawQuery || typeof rawQuery !== 'string' || !rawQuery.trim()) {
@@ -1834,9 +2539,21 @@ app.get('/api/ai', async (req, res) => {
       { role: 'user', parts: [{ text: userMessage }] },
     ];
 
+    let systemInstruction = SYSTEM_INSTRUCTION;
+
+    // Inject Twitch Live Stream Visual Memory into system instruction
+    const visualContext = getVisualMemoryContext(6);
+    if (visualContext) {
+      systemInstruction += `\n\n[الذاكرة البصرية للبث الحي - ما شاهده جعفر في لقطات البث الأخيرة]:\n${visualContext}\nتنبيه مهم: إذا سُئلت عن شيء حدث في البث المباشر (مثل وش صار، وش اللعبة، وش سوا جيف، فاز أو خسر)، أجب فقط بناءً على ما رأيته وسُجل في الذاكرة البصرية أعلاه. إذا لم تكن اللقطة أو الحدث مسجلاً في الذاكرة البصرية، قل بصراحة وعفوية أنك ما شفت اللقطة ذيك وما انتبهت لها، ولا تخترع أبداً أحداثاً لم تشاهدها.`;
+    }
+
+    if (isJito) {
+      systemInstruction += `\n\nتنبيه خاص للمحادثة الحالية: المتابع الذي يكلمك الآن عبر الأمر هو "جيتو" (مطورك وصانعك وأفضل مود في القناة، حسابه في تويتش هو @${username}). خاطبه وناده باسم "جيتو" دائماً في ردك (مثال: "هلا يا جيتو"، "أبشر يا جيتو"، "كفو يا جيتو")، وعامله بمكانته الخاصة كصانعك، واجعل الرد مختصراً ومناسباً لسرعة شات تويتش.`;
+    }
+
     // Standard generation configuration
     const generationConfig = {
-      systemInstruction: SYSTEM_INSTRUCTION,
+      systemInstruction,
       temperature: 0.85,
       maxOutputTokens: 120,
     };
@@ -1894,7 +2611,8 @@ app.get('/api/answer', async (req, res) => {
   const rawQuery = req.query.q;
   const rawUser = req.query.user;
   const username = (rawUser && typeof rawUser === 'string' && rawUser.trim()) ? rawUser.trim() : 'global';
-  const userKey = username.toLowerCase();
+  const isJito = isJitoChatter(username);
+  const userKey = isJito ? getJitoMemoryKey() : username.toLowerCase();
 
   // Check if viewer provided an answer
   if (!rawQuery || typeof rawQuery !== 'string' || !rawQuery.trim()) {
@@ -2217,6 +2935,11 @@ app.get('/auth/twitch/callback', async (req, res) => {
     // Initiate Twitch Chat EventSub WebSocket connection now that OAuth is authorized
     startTwitchChatConnection();
 
+    // Resolve Jito permanent User ID if needed
+    resolveJitoTwitchIdentity().catch(err => {
+      console.warn('[Jito Identity] Background resolution notice on OAuth callback:', err?.message || err);
+    });
+
     // 7. Render simple, polished success view
     return res.type('html').send(`<!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -2499,6 +3222,21 @@ app.get('/api/twitch/chat/status', (req, res) => {
       hasUserMemory: true,
       geminiReady: Boolean(getGeminiClient()),
       autoReplyEnabled: AUTO_REPLY_TO_TWITCH_CHAT,
+    },
+    jitoIdentity: {
+      userId: jitoIdentity.userId,
+      login: jitoIdentity.login,
+      knownLogins: Array.from(jitoIdentity.knownLogins),
+      resolvedAt: jitoIdentity.resolvedAt,
+    },
+    vision: {
+      enabled: visionState.enabled,
+      intervalSeconds: visionState.intervalSeconds,
+      lastCaptureAt: visionState.lastCaptureAt,
+      lastAnalysisAt: visionState.lastAnalysisAt,
+      lastStatus: visionState.lastStatus,
+      visualFramesCount: currentStreamSession.visualMemory ? currentStreamSession.visualMemory.length : 0,
+      recentVisualFrames: currentStreamSession.visualMemory ? currentStreamSession.visualMemory.slice(-3) : [],
     },
     stats: {
       messagesReceived: twitchChatState.stats.messagesReceived,
@@ -2830,6 +3568,48 @@ app.get('/', (req, res) => {
         <div class="status-label">اتصال الشات (EventSub WS)</div>
         <div class="status-value" id="twitchChatCardStatus" style="font-size: 13px;">جاري الفحص...</div>
       </div>
+      <div class="status-card">
+        <div class="status-label">رؤية البث المباشر (Vision)</div>
+        <div class="status-value" id="twitchVisionCardStatus" style="font-size: 13px;">كل ${VISION_INTERVAL_SECONDS} ثوانٍ</div>
+      </div>
+    </div>
+
+    <!-- Twitch Stream Vision Card -->
+    <div class="card" style="border: 1px solid #D1D5DB;">
+      <h2>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#111827" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+        نظام الرؤية والذاكرة البصرية للبث الحي (Twitch Live Vision)
+      </h2>
+      <p class="card-caption">
+        يلتقط لقطات شاشة (Frames) مباشرة من البث الحي للقناة المستهدفة (<code style="background: #F3F4F6; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 12px;">@${TWITCH_BROADCASTER_LOGIN || '8jef'}</code>) كل <strong>${VISION_INTERVAL_SECONDS} ثانية</strong> (قابل للتعديل عبر <code style="background: #F3F4F6; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 11px;">VISION_INTERVAL_SECONDS</code>)، ويحللها بـ Gemini لتوثيق أحداث البث في ذاكرة الجلسة الحالية دون أي إزعاج أو ردود تلقائية بالشات:
+      </p>
+
+      <div style="background: #F9FAFB; border: 1px solid var(--card-border); border-radius: 8px; padding: 16px 20px; margin-bottom: 16px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 12px;">
+          <div>
+            <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 2px;">حالة الرؤية الحالية:</div>
+            <div id="visionStatusDetailed" style="font-weight: 600; font-size: 14px;">جاري الفحص...</div>
+          </div>
+          <div style="display: flex; gap: 10px; align-items: center;">
+            <button id="btnCaptureFrame" class="btn-primary" onclick="triggerTestCapture()">تجربة التقاط وتحليل فريم الآن</button>
+            <a href="/api/vision/status" target="_blank" class="btn-secondary" style="font-size: 12px; text-decoration: none;">عرض JSON الذاكرة</a>
+          </div>
+        </div>
+        <div style="font-size: 12px; color: var(--text-muted); display: flex; gap: 16px; flex-wrap: wrap;">
+          <span>القناة المستهدفة: <strong style="color: var(--text);">@${TWITCH_BROADCASTER_LOGIN || '8jef'}</strong></span>
+          <span>الفاصل الزمني: <strong style="color: var(--text);">${VISION_INTERVAL_SECONDS} ثانية</strong></span>
+          <span>الفريمات المسجلة بالجلسة: <strong id="visionCountSpan" style="color: var(--text);">0</strong></span>
+        </div>
+      </div>
+
+      <div id="visionLivePreviewBox" style="display: none; background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 8px; padding: 14px; margin-bottom: 14px;">
+        <div style="font-size: 12px; font-weight: 600; color: #374151; margin-bottom: 6px;">آخر لقطة ملتقطة ومحللة:</div>
+        <div id="visionLivePreviewText" style="font-size: 13px; line-height: 1.6; color: #111827;"></div>
+      </div>
+
+      <div style="font-size: 12px; color: var(--text-muted); line-height: 1.6;">
+        🛡️ <strong>حماية الكوتا وعدم التكرار:</strong> يعتمد النظام على فحص هاش MD5 لمنع إعادة تحليل الصور المتطابقة عند عدم تغير شاشة الـ CDN، كما تُمسح الذاكرة البصرية تلقائياً فور انتهاء البث وبدء بث جديد.
+      </div>
     </div>
 
     <!-- Twitch OAuth Card -->
@@ -2975,6 +3755,26 @@ app.get('/', (req, res) => {
           <span class="status-ok">200 JSON</span>
         </div>
       </div>
+      <div class="endpoint-item">
+        <div style="display: flex; align-items: center;">
+          <span class="method method-purple">GET</span>
+          <code style="color: #374151; font-weight: 500; margin-right: 8px;">/api/vision/status</code>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span style="color: var(--text-muted); font-size: 13px;">فحص حالة الرؤية وقائمة الذاكرة البصرية الحالية</span>
+          <span class="status-ok">200 JSON</span>
+        </div>
+      </div>
+      <div class="endpoint-item">
+        <div style="display: flex; align-items: center;">
+          <span class="method method-green">ALL</span>
+          <code style="color: #374151; font-weight: 500; margin-right: 8px;">/api/vision/capture</code>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span style="color: var(--text-muted); font-size: 13px;">التقاط وتحليل فريم تجريبي فوري</span>
+          <span class="status-ok">200 JSON</span>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -3019,6 +3819,88 @@ app.get('/', (req, res) => {
         }
       })
       .catch(() => {});
+
+    // Refresh Vision Status
+    function refreshVisionStatus() {
+      fetch('/api/vision/status')
+        .then(res => res.json())
+        .then(data => {
+          const vDetailed = document.getElementById('visionStatusDetailed');
+          const vCard = document.getElementById('twitchVisionCardStatus');
+          const vCount = document.getElementById('visionCountSpan');
+          const previewBox = document.getElementById('visionLivePreviewBox');
+          const previewText = document.getElementById('visionLivePreviewText');
+
+          if (vCount) vCount.innerText = data.visualFramesCount || 0;
+
+          if (vDetailed) {
+            if (data.isLive) {
+              vDetailed.innerHTML = '<span style="color: #065F46;">🟢 البث المباشر شغال (LIVE) • الرؤية نشطة كل ' + data.intervalSeconds + 'ث</span>';
+              if (vCard) vCard.innerHTML = '<span style="color: #065F46;">نشط (Live)</span>';
+            } else {
+              vDetailed.innerHTML = '<span style="color: #4B5563;">⚪ البث متوقف حالياً (Offline) • بانتظار بدء البث</span>';
+              if (vCard) vCard.innerHTML = '<span style="color: #4B5563;">بانتظار البث (' + data.intervalSeconds + 's)</span>';
+            }
+          }
+
+          if (data.visualMemory && data.visualMemory.length > 0) {
+            const latest = data.visualMemory[data.visualMemory.length - 1];
+            if (previewBox && previewText) {
+              previewBox.style.display = 'block';
+              previewText.innerHTML = '<strong>[' + (latest.timeFormatted || '') + ']</strong> ' + latest.summary;
+            }
+          }
+        })
+        .catch(() => {});
+    }
+
+    refreshVisionStatus();
+    setInterval(refreshVisionStatus, 15000);
+
+    // Trigger test capture
+    async function triggerTestCapture() {
+      const btn = document.getElementById('btnCaptureFrame');
+      const vDetailed = document.getElementById('visionStatusDetailed');
+      const previewBox = document.getElementById('visionLivePreviewBox');
+      const previewText = document.getElementById('visionLivePreviewText');
+
+      if (btn) {
+        btn.disabled = true;
+        btn.innerText = 'جاري التقاط وتحليل الفريم...';
+      }
+
+      try {
+        const res = await fetch('/api/vision/capture?force=true&test=true');
+        const data = await res.json();
+        if (data.status === 'analyzed' && data.entry) {
+          if (previewBox && previewText) {
+            previewBox.style.display = 'block';
+            previewText.innerHTML = '<strong>[' + (data.entry.timeFormatted || '') + ']</strong> ' + data.entry.summary;
+          }
+          if (vDetailed) {
+            vDetailed.innerHTML = '<span style="color: #065F46;">✓ تم التقاط وتحليل فريم بنجاح!</span>';
+          }
+        } else if (data.status === 'unchanged') {
+          if (vDetailed) {
+            vDetailed.innerHTML = '<span style="color: #2563EB;">ℹ️ الفريم لم يتغير في الـ CDN (تم التجاوز لحفظ الكوتا)</span>';
+          }
+        } else {
+          if (vDetailed) {
+            vDetailed.innerHTML = '<span style="color: #B45309;">⚠️ حالة الالتقاط: ' + (data.status || data.error || 'فشل') + '</span>';
+          }
+        }
+        refreshVisionStatus();
+      } catch (err) {
+        if (vDetailed) {
+          vDetailed.innerHTML = '<span style="color: #DC2626;">❌ فشل الاتصال بالسيرفر</span>';
+        }
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerText = 'تجربة التقاط وتحليل فريم الآن';
+        }
+      }
+    }
 
     function setQuery(text) {
       document.getElementById('queryInput').value = text;
@@ -3077,6 +3959,20 @@ app.listen(PORT, '0.0.0.0', async () => {
     }
   } catch (err) {
     console.error('[Twitch Storage] Error restoring OAuth session on startup:', err?.message || err);
+  }
+
+  // Ensure Jito identity is logged and resolved
+  if (jitoIdentity.userId) {
+    console.log(`[Jito Identity] Initialized with permanent Twitch User ID: ${jitoIdentity.userId} (known logins: ${Array.from(jitoIdentity.knownLogins).join(', ')})`);
+  } else {
+    console.log(`[Jito Identity] Jito username tracker initialized (current: @${jitoIdentity.login}, alternate: @4VREN). Permanent User ID will resolve via Twitch API.`);
+  }
+
+  // Start Twitch Stream Vision loop
+  try {
+    startVisionLoop();
+  } catch (visionErr) {
+    console.error('[Vision] Error starting vision loop:', visionErr?.message || visionErr);
   }
 });
 
