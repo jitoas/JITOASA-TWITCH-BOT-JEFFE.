@@ -43,6 +43,9 @@ const visionState = {
   timer: null,
   isChecking: false,
   streamWasLive: false,
+  latestStreamTitle: null,
+  latestStreamGame: null,
+  latestStreamUpdatedAt: null,
 };
 
 // General Web Search Engine Configuration (Real-time modern & general info)
@@ -370,6 +373,9 @@ let currentStreamSession = {
   messages: [], // Array of { id, userId, userLogin, userName, text, color, badges, isBroadcaster, isModerator, isVip, isSubscriber, isJito, timestamp, timeFormatted, isMention, isReplyToBot, replyParent }
   visualMemory: [], // Array of { timestamp, timeFormatted, summary, game, title }
   streamInfo: null,
+  latestStreamTitle: null,
+  latestStreamGame: null,
+  latestStreamUpdatedAt: null,
   stats: {
     totalMessages: 0,
     mentionsCount: 0,
@@ -448,6 +454,9 @@ function startNewStreamSession(streamEvent = null) {
     messages: [],
     visualMemory: [], // Pristine visual memory for this stream only
     streamInfo: streamEvent || null,
+    latestStreamTitle: streamEvent?.title || null,
+    latestStreamGame: streamEvent?.game_name || null,
+    latestStreamUpdatedAt: streamEvent ? now : null,
     stats: {
       totalMessages: 0,
       mentionsCount: 0,
@@ -455,6 +464,9 @@ function startNewStreamSession(streamEvent = null) {
       visualFramesCount: 0,
     },
   };
+  if (streamEvent?.title) visionState.latestStreamTitle = streamEvent.title;
+  if (streamEvent?.game_name) visionState.latestStreamGame = streamEvent.game_name;
+  if (streamEvent) visionState.latestStreamUpdatedAt = now;
 
   // Reset vision frame hash for clean stream boundary
   visionState.lastFrameHash = null;
@@ -715,11 +727,18 @@ async function prepareJaafarChatReplyPipeline({ chatEvent, analysis, record }) {
     promptText += 'رد عليه بأسلوب جعفر العفوي والمحبوب، وبشكل مختصر جداً مناسب للشات.';
   }
 
-  // Inject Twitch Live Stream Visual Memory ONLY if user explicitly asked about stream/screen/gameplay
-  if (needsVisualContext(record.text)) {
-    const visualContext = getVisualMemoryContext(6);
-    if (visualContext) {
-      promptText += `\n\n[الذاكرة البصرية للبث الحي - ما شاهده جعفر في لقطات البث الأخيرة]:\n${visualContext}\nتنبيه مهم: أجب بناءً على ما رأيته وسُجل في الذاكرة البصرية أعلاه. إذا كان السؤال عن لقطة أو حدث لم تشاهده أو لم يظهر في الفريمات المسجلة، قل بصراحة وعفوية أنك ما شفت اللقطة ذيك وما انتبهت لها، ولا تخترع أبداً أحداثاً من عندك.`;
+  // Inject Twitch Live Stream Metadata and Visual Memory when relevant to user query
+  const askingTitle = isAskingAboutStreamTitle(record.text);
+  const askingGame = isAskingAboutCurrentGame(record.text);
+  const askingVisual = needsVisualContext(record.text);
+
+  if (askingTitle || askingGame || askingVisual) {
+    promptText += `\n${getStreamMetadataContext()}`;
+    if (askingVisual) {
+      const visualContext = getVisualMemoryContext(6);
+      if (visualContext) {
+        promptText += `\n\n[الذاكرة البصرية للبث الحي - ما شاهده جعفر في لقطات البث الأخيرة من الشاشة]:\n${visualContext}\nتنبيه مهم: أجب بناءً على ما رأيته وسُجل في الذاكرة البصرية أعلاه. إذا كان السؤال عن لقطة أو حدث لم تشاهده أو لم يظهر في الفريمات المسجلة، قل بصراحة وعفوية أنك ما شفت اللقطة ذيك وما انتبهت لها، ولا تخترع أبداً أحداثاً من عندك. تذكر أن الذاكرة البصرية لا تحدد عنوان البث أو اسم اللعبة.`;
+      }
     }
   }
 
@@ -2829,11 +2848,18 @@ async function processAiQueryEngine({ query, username = 'global' }) {
     const currentSaudiTime = getSaudiTimeContext();
     systemInstruction += `\n\n[معلومات التوقيت والتاريخ الحالي]:\nالتاريخ اليوم بتوقيت الرياض (السعودية) هو: ${currentSaudiTime.dateArabic} (${currentSaudiTime.isoDate})، والساعة الآن: ${currentSaudiTime.timeArabic}. اعتمد هذا التاريخ والوقت كحقيقة مطلقة وحيدة لأي سؤال عن اليوم أو التاريخ أو الوقت الحالي.`;
 
-    // Inject Twitch Live Stream Visual Memory into system instruction ONLY if user asks about stream/gameplay
-    if (needsVisualContext(userMessage)) {
-      const visualContext = getVisualMemoryContext(6);
-      if (visualContext) {
-        systemInstruction += `\n\n[الذاكرة البصرية للبث الحي - ما شاهده جعفر في لقطات البث الأخيرة]:\n${visualContext}\nتنبيه مهم: أجب بناءً على ما رأيته وسُجل في الذاكرة البصرية أعلاه. إذا لم تكن اللقطة أو الحدث مسجلاً في الذاكرة البصرية، قل بصراحة وعفوية أنك ما شفت اللقطة ذيك وما انتبهت لها، ولا تخترع أبداً أحداثاً لم تشاهدها.`;
+    // Inject Twitch Live Stream Metadata and Visual Memory into system instruction when relevant
+    const askingTitle = isAskingAboutStreamTitle(userMessage);
+    const askingGame = isAskingAboutCurrentGame(userMessage);
+    const askingVisual = needsVisualContext(userMessage);
+
+    if (askingTitle || askingGame || askingVisual) {
+      systemInstruction += `\n${getStreamMetadataContext()}`;
+      if (askingVisual) {
+        const visualContext = getVisualMemoryContext(6);
+        if (visualContext) {
+          systemInstruction += `\n\n[الذاكرة البصرية للبث الحي - ما شاهده جعفر في لقطات البث الأخيرة من الشاشة]:\n${visualContext}\nتنبيه مهم: أجب بناءً على ما رأيته وسُجل في الذاكرة البصرية أعلاه. إذا لم تكن اللقطة أو الحدث مسجلاً في الذاكرة البصرية، قل بصراحة وعفوية أنك ما شفت اللقطة ذيك وما انتبهت لها، ولا تخترع أبداً أحداثاً لم تشاهدها. تذكر أن الذاكرة البصرية لا تحدد عنوان البث أو اسم اللعبة.`;
+        }
       }
     }
 
@@ -3660,6 +3686,43 @@ function formatWebSearchResultsContext(searchData) {
  */
 
 /**
+ * Detects if a chat query asks about the Twitch live stream Title.
+ */
+function isAskingAboutStreamTitle(text) {
+  if (!text || typeof text !== 'string') return false;
+  const t = text.trim().toLowerCase();
+  const titlePatterns = [
+    /(عنوان|تايتل|اسم|تسمي[ةه]|تسمية)\s*(البث|الستريم|اللايف|حق البث|حق الستريم)/i,
+    /(وش|ايش|شنو|شو|ماهو|ما هو|علمني|قل لي)\s*(عنوان|تايتل|اسم)\s*(البث|الستريم|اللايف|حقه|حقك)?/i,
+    /وش\s*كاتب\s*(في|بال)?\s*(العنوان|التايتل|البث|الستريم)/i,
+    /ايش\s*كاتب\s*(في|بال)?\s*(العنوان|التايتل|البث|الستريم)/i,
+    /وش\s*حاط\s*(في|بال)?\s*(العنوان|التايتل)/i,
+    /ايش\s*حاط\s*(في|بال)?\s*(العنوان|التايتل)/i,
+    /(عنوان|تايتل)\s*(البث|الستريم|اللايف)/i,
+    /stream\s*title|title\s*of\s*(the\s*)?stream/i,
+  ];
+  return titlePatterns.some(p => p.test(t));
+}
+
+/**
+ * Detects if a chat query asks about the current game or category being streamed.
+ */
+function isAskingAboutCurrentGame(text) {
+  if (!text || typeof text !== 'string') return false;
+  const t = text.trim().toLowerCase();
+  const gamePatterns = [
+    /(وش|ايش|شنو|شو|ماذا)\s*(يلعب|تلعب|اللعب[ةه]|القيم|الجيم|تصنيف البث|تصنيف الستريم|كاتيجوري|الكاتيجوري)/i,
+    /(اسم|شسم)\s*(اللعب[ةه]|القيم|الجيم|اللي يلعب)/i,
+    /اللعب[ةه]\s*(الحالي[ةه]|اللي يلعبها|اللي يلعب)/i,
+    /تصنيف\s*(البث|الستريم|اللايف)/i,
+    /(وش|ايش|شنو|شو)\s*(كاتيجوري|الكاتيجوري)/i,
+    /(وش|ايش|شنو|شو)\s*يلعب\s*(جيف|الستريمر)?/i,
+    /what\s*game|current\s*game|category/i,
+  ];
+  return gamePatterns.some(p => p.test(t));
+}
+
+/**
  * Detects if a chat query explicitly asks about live stream visual/gameplay events,
  * current game, screen content, or match status.
  */
@@ -3686,12 +3749,8 @@ function needsVisualContext(text) {
 
   // Gameplay / what's happening / what Jef is playing / match status patterns
   const gameplayPatterns = [
-    /(وش|ايش|شنو|شو|ماذا)\s*(يلعب|تلعب|اللعب[ةه]|القيم|الجيم|الكاركتر|الشخصي[ةه]|الهيرو|البطل|السلاح|الرانك|السكور|النتيج[ةه]|صاير|قاعد يصير|جالس يصير|يصير|سوا|سوى|فعل)/i,
+    /(وش|ايش|شنو|شو|ماذا)\s*(الكاركتر|الشخصي[ةه]|الهيرو|البطل|السلاح|الرانك|السكور|النتيج[ةه]|صاير|قاعد يصير|جالس يصير|يصير|سوا|سوى|فعل)/i,
     /(وش|ايش|شنو|شو)\s*(صار|حصل)\s*(في|بال|مع|حق)?\s*(القيم|الجيم|البث|الستريم|اللعب[ةه]|الراوند|الماتش|جيف)?/i,
-    /اسم اللعب[ةه]/i,
-    /شسم اللعب[ةه]/i,
-    /اللعب[ةه] الحالي[ةه]/i,
-    /اللعب[ةه] اللي يلعب/i,
     /(فاز|خسر|ينهزم|ينتصر)\s*(ولا|أو|او|جيف)?/i,
     /(كم|وش|ايش)\s*(السكور|النتيجة|النتيج[ةه]|الرانك|الكيلز|كيل|جابلهم|جايب)/i,
     /كيف (لعبه|اللعب|القيم|الجيم|الماتش)/i,
@@ -3702,6 +3761,27 @@ function needsVisualContext(text) {
   ];
 
   return screenPatterns.some(p => p.test(t)) || gameplayPatterns.some(p => p.test(t));
+}
+
+/**
+ * Builds grounded stream metadata context containing latestStreamTitle and latestStreamGame
+ */
+function getStreamMetadataContext() {
+  const title = currentStreamSession.latestStreamTitle || visionState.latestStreamTitle || currentStreamSession.streamInfo?.title || null;
+  const game = currentStreamSession.latestStreamGame || visionState.latestStreamGame || currentStreamSession.streamInfo?.game_name || null;
+  const isLive = Boolean(currentStreamSession.active || visionState.streamWasLive);
+
+  let block = `\n[بيانات البث المباشر الرسمية المؤكدة من تويتش]:\n`;
+  block += `- حالة البث: ${isLive ? 'البث مباشر الآن (LIVE)' : 'البث متوقف أو غير مؤكد حالياً'}\n`;
+  block += `- عنوان البث الحالي الحرفي (latestStreamTitle): ${title ? `"${title}"` : 'غير متوفر / لم يتم التقاطه بعد'}\n`;
+  block += `- اللعبة / التصنيف الحالي المؤكد (latestStreamGame): ${game ? `"${game}"` : 'غير متوفر / لم يتم التقاطه بعد'}\n`;
+
+  block += `\nقواعد إلزامية وصارمة بخصوص عنوان البث واللعبة الحالية:\n`;
+  block += `1. إذا سأل المستخدم عن عنوان البث (Title / تايتل البث / وش عنوان البث / وش العنوان): اذكر حصرياً العنوان الحرفي المذكور في latestStreamTitle (${title ? `"${title}"` : 'غير متوفر'}). اذكره كما هو بالضبط بدون أي تعديل أو تحريف أو اختراع عنوان من عندك. إذا كان غير متوفر، قل بوضوح وعفوية أنك ما تدري أو أن البيانات ما تحدثت بعد، ولا تخترع أبداً أي عنوان.\n`;
+  block += `2. إذا سأل المستخدم عن اللعبة الحالية (Game / التصنيف / وش يلعب جيف / وش اللعبة): اعتمد حصرياً وبشكل قطعي على latestStreamGame (${game ? `"${game}"` : 'غير متوفر'}) كمصدر رسمي ووحيد للعبة الحالية. إذا كانت غير متوفرة، قل بوضوح أنك غير متأكد أو أن البيانات لم تتحدث بعد، ولا تذكر لعبة قديمة (مثل Marvel Rivals أو غيرها) إلا إذا كانت هي المذكورة صراحة في latestStreamGame.\n`;
+  block += `3. الذاكرة البصرية (visualMemory) مخصصة فقط للأحداث والمشاهد البصرية داخل الشاشة (مثل نتيجة الراوند، الكيلز، ما يحدث في اللقطة)، ولا تعتبر مصدراً رسمياً لعنوان البث أو اسم اللعبة الحالية.\n`;
+
+  return block;
 }
 
 /**
@@ -3735,8 +3815,18 @@ async function captureStreamFrame({ force = false, isTest = false } = {}) {
         console.log('[Vision] Stream is live');
         currentStreamSession.active = true;
         currentStreamSession.type = 'live';
-        currentStreamSession.streamInfo = liveStreamData;
       }
+      currentStreamSession.streamInfo = liveStreamData;
+      if (liveStreamData.title) {
+        currentStreamSession.latestStreamTitle = liveStreamData.title;
+        visionState.latestStreamTitle = liveStreamData.title;
+      }
+      if (liveStreamData.game_name) {
+        currentStreamSession.latestStreamGame = liveStreamData.game_name;
+        visionState.latestStreamGame = liveStreamData.game_name;
+      }
+      currentStreamSession.latestStreamUpdatedAt = new Date().toISOString();
+      visionState.latestStreamUpdatedAt = currentStreamSession.latestStreamUpdatedAt;
       visionState.streamWasLive = true;
     } else if (currentStreamSession.active) {
       visionState.streamWasLive = true;
@@ -3825,8 +3915,8 @@ async function captureStreamFrame({ force = false, isTest = false } = {}) {
   }
 
   const base64Data = buffer.toString('base64');
-  const game = currentStreamSession.streamInfo?.game_name || '';
-  const title = currentStreamSession.streamInfo?.title || '';
+  const game = currentStreamSession.latestStreamGame || visionState.latestStreamGame || currentStreamSession.streamInfo?.game_name || '';
+  const title = currentStreamSession.latestStreamTitle || visionState.latestStreamTitle || currentStreamSession.streamInfo?.title || '';
 
   const prompt = `أنت جعفر، شات بوت تويتش الخاص بالستريمر جيف (8jef). حلل لقطة الشاشة الملتقطة الآن من البث المباشر${game ? ` (اللعبة الحالية: ${game})` : ''}${title ? ` (عنوان البث: ${title})` : ''}.
 اكتب ملخصاً نصياً قصيراً ومركزاً جداً (من سطر إلى سطرين باللغة العربية) للأشياء المهمة التي شاهدتها في الفريم:
@@ -3986,6 +4076,9 @@ app.get('/api/vision/status', (req, res) => {
     isLive: currentStreamSession.active,
     streamId: currentStreamSession.id,
     broadcaster: TWITCH_BROADCASTER_LOGIN || '8jef',
+    latestStreamTitle: currentStreamSession.latestStreamTitle || visionState.latestStreamTitle || null,
+    latestStreamGame: currentStreamSession.latestStreamGame || visionState.latestStreamGame || null,
+    latestStreamUpdatedAt: currentStreamSession.latestStreamUpdatedAt || visionState.latestStreamUpdatedAt || null,
     lastCaptureAt: visionState.lastCaptureAt,
     lastAnalysisAt: visionState.lastAnalysisAt,
     lastStatus: visionState.lastStatus,
@@ -4008,6 +4101,9 @@ app.all('/api/vision/capture', async (req, res) => {
       success: result.status === 'analyzed' || result.status === 'unchanged',
       ...result,
       isLive: currentStreamSession.active,
+      latestStreamTitle: currentStreamSession.latestStreamTitle || visionState.latestStreamTitle || null,
+      latestStreamGame: currentStreamSession.latestStreamGame || visionState.latestStreamGame || null,
+      latestStreamUpdatedAt: currentStreamSession.latestStreamUpdatedAt || visionState.latestStreamUpdatedAt || null,
       visualMemoryCount: currentStreamSession.visualMemory ? currentStreamSession.visualMemory.length : 0,
       recentVisualMemory: currentStreamSession.visualMemory ? currentStreamSession.visualMemory.slice(-5) : [],
     });
@@ -6408,6 +6504,10 @@ app.get('/', (req, res) => {
           <span>الفاصل الزمني: <strong style="color: var(--text);">${VISION_INTERVAL_SECONDS} ثانية</strong></span>
           <span>الفريمات المسجلة بالجلسة: <strong id="visionCountSpan" style="color: var(--text);">0</strong></span>
         </div>
+        <div id="visionMetadataRow" style="margin-top: 10px; padding-top: 10px; border-top: 1px dashed #E5E7EB; font-size: 12px; color: var(--text-muted); display: flex; gap: 16px; flex-wrap: wrap;">
+          <span>آخر عنوان مقروء (latestStreamTitle): <strong id="visionLatestTitleSpan" style="color: var(--text);">غير متوفر</strong></span>
+          <span>اللعبة الحالية (latestStreamGame): <strong id="visionLatestGameSpan" style="color: #4338CA;">غير متوفر</strong></span>
+        </div>
       </div>
 
       <div id="visionLivePreviewBox" style="display: none; background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 8px; padding: 14px; margin-bottom: 14px;">
@@ -6759,6 +6859,11 @@ app.get('/', (req, res) => {
               if (vCard) vCard.innerHTML = '<span style="color: #4B5563;">بانتظار البث (' + data.intervalSeconds + 's)</span>';
             }
           }
+
+          const titleSpan = document.getElementById('visionLatestTitleSpan');
+          const gameSpan = document.getElementById('visionLatestGameSpan');
+          if (titleSpan) titleSpan.innerText = data.latestStreamTitle || 'غير متوفر / لم يتم التقاطه بعد';
+          if (gameSpan) gameSpan.innerText = data.latestStreamGame || 'غير متوفر / لم يتم التقاطه بعد';
 
           if (data.visualMemory && data.visualMemory.length > 0) {
             const latest = data.visualMemory[data.visualMemory.length - 1];
