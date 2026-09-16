@@ -3282,7 +3282,7 @@ function buildSearchQuery(userQuery) {
 }
 
 /**
- * Executes web search using DuckDuckGo HTML scraping
+ * Executes web search using DuckDuckGo HTML & Lite multi-source fallback
  */
 async function performWebSearch(rawQuery) {
   if (!WEB_SEARCH_ENABLED) {
@@ -3297,79 +3297,105 @@ async function performWebSearch(rawQuery) {
   webSearchState.lastQuery = query;
   webSearchState.lastSearchAt = new Date().toISOString();
 
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 7000);
+  // Try multiple DuckDuckGo endpoints with fallback
+  const endpoints = [
+    {
+      name: 'DuckDuckGo HTML',
+      url: `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+      timeoutMs: 9000,
+    },
+    {
+      name: 'DuckDuckGo Lite',
+      url: `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`,
+      timeoutMs: 9000,
+    },
+  ];
 
-    const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
-        'Referer': 'https://html.duckduckgo.com/',
-      },
-      signal: controller.signal,
-    });
+  let lastErrorMsg = null;
 
-    clearTimeout(timeoutId);
+  for (const endpoint of endpoints) {
+    let timeoutId = null;
+    try {
+      const controller = new AbortController();
+      timeoutId = setTimeout(() => controller.abort(), endpoint.timeoutMs);
 
-    if (!response.ok) {
-      throw new Error(`DuckDuckGo responded with HTTP ${response.status}`);
-    }
+      const response = await fetch(endpoint.url, {
+        method: 'GET',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
+          'Cache-Control': 'no-cache',
+        },
+        signal: controller.signal,
+      });
 
-    const html = await response.text();
+      if (timeoutId) clearTimeout(timeoutId);
 
-    // Regex to extract title, snippet, and link from DuckDuckGo HTML output
-    const results = [];
-    const blockRegex = /<a[^>]+class="result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
-    const titleRegex = /<a[^>]+class="result__url[^"]*"[^>]*href="([^"]+)"[^>]*>[\s\S]*?<\/a>[\s\S]*?<a[^>]+class="result__snippet/gi;
-    
-    // Comprehensive snippet and title parsing
-    const snippetMatches = [...html.matchAll(/<a[^>]+class="result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi)];
-    const titleMatches = [...html.matchAll(/<h2[^>]*>\s*<a[^>]+class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi)];
-
-    for (let i = 0; i < Math.min(titleMatches.length, 5); i++) {
-      const title = stripHtmlAndDecode(titleMatches[i][2]);
-      const link = titleMatches[i][1] || '';
-      const snippet = snippetMatches[i] ? stripHtmlAndDecode(snippetMatches[i][1]) : '';
-
-      if (snippet || title) {
-        results.push({
-          title,
-          snippet,
-          link: link.startsWith('//') ? `https:${link}` : link,
-        });
+      if (!response.ok) {
+        throw new Error(`${endpoint.name} responded with HTTP ${response.status}`);
       }
+
+      const html = await response.text();
+      const results = [];
+
+      // Comprehensive snippet and title parsing (works for both HTML and Lite endpoints)
+      const snippetMatches = [...html.matchAll(/<a[^>]+class="result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>|<td[^>]+class="result-snippet"[^>]*>([\s\S]*?)<\/td>/gi)];
+      const titleMatches = [...html.matchAll(/<h2[^>]*>\s*<a[^>]+class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>|<a[^>]+class="result-link"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi)];
+
+      const count = Math.min(Math.max(titleMatches.length, snippetMatches.length), 5);
+      for (let i = 0; i < count; i++) {
+        const titleRaw = titleMatches[i] ? (titleMatches[i][2] || titleMatches[i][4] || '') : '';
+        const linkRaw = titleMatches[i] ? (titleMatches[i][1] || titleMatches[i][3] || '') : '';
+        const snippetRaw = snippetMatches[i] ? (snippetMatches[i][1] || snippetMatches[i][2] || '') : '';
+
+        const title = stripHtmlAndDecode(titleRaw);
+        const snippet = stripHtmlAndDecode(snippetRaw);
+        let link = linkRaw.trim();
+        if (link.startsWith('//')) link = `https:${link}`;
+
+        if (snippet || title) {
+          results.push({
+            title,
+            snippet,
+            link,
+          });
+        }
+      }
+
+      if (results.length > 0) {
+        const duration = Date.now() - startTime;
+        webSearchState.lastResultsCount = results.length;
+        webSearchState.totalSearches++;
+        webSearchState.lastError = null;
+
+        console.log(`[WebSearch] Completed search via ${endpoint.name} for "${query}" in ${duration}ms with ${results.length} results.`);
+        return {
+          success: true,
+          query,
+          results,
+          durationMs: duration,
+          saudiTime: getSaudiTimeContext(),
+        };
+      }
+    } catch (endpointErr) {
+      if (timeoutId) clearTimeout(timeoutId);
+      lastErrorMsg = endpointErr?.message || String(endpointErr);
+      console.warn(`[WebSearch] ${endpoint.name} attempt failed:`, lastErrorMsg);
     }
-
-    const duration = Date.now() - startTime;
-    webSearchState.lastResultsCount = results.length;
-    webSearchState.totalSearches++;
-    webSearchState.lastError = null;
-
-    console.log(`[WebSearch] Completed search for "${query}" in ${duration}ms with ${results.length} results.`);
-    return {
-      success: true,
-      query,
-      results,
-      durationMs: duration,
-      saudiTime: getSaudiTimeContext(),
-    };
-  } catch (error) {
-    const duration = Date.now() - startTime;
-    console.error(`[WebSearch] Search failed for "${query}":`, error?.message || error);
-    webSearchState.lastError = error?.message || String(error);
-    return {
-      success: false,
-      query,
-      results: [],
-      error: error?.message || String(error),
-      durationMs: duration,
-      saudiTime: getSaudiTimeContext(),
-    };
   }
+
+  const duration = Date.now() - startTime;
+  console.error(`[WebSearch] All search endpoints failed for "${query}":`, lastErrorMsg);
+  webSearchState.lastError = lastErrorMsg;
+  return {
+    success: false,
+    query,
+    results: [],
+    error: lastErrorMsg,
+    durationMs: duration,
+    saudiTime: getSaudiTimeContext(),
+  };
 }
 
 /**
