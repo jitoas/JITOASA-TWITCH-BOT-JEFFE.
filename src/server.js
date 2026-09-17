@@ -2523,13 +2523,15 @@ function normalizeTextForAutoMod(str) {
   if (!str || typeof str !== 'string') return '';
   return str
     .toLowerCase()
+    .replace(/@/g, '')                     // remove @ from mentions like @jaafarbot / @jaafar
     .replace(/[\u064B-\u065F\u0670]/g, '') // remove Arabic diacritics / tashkeel
     .replace(/ـ+/g, '')                    // remove tatweel
     .replace(/[أإآ]/g, 'ا')
     .replace(/ى/g, 'ي')
     .replace(/ؤ/g, 'و')
     .replace(/ئ/g, 'ي')
-    .replace(/ة/g, 'ه');
+    .replace(/ة/g, 'ه')
+    .replace(/(.)\1+/gu, '$1');            // collapse repeated elongated letters (e.g. غبييييي -> غبي / حماااار -> حمار / بوووت -> بوت)
 }
 
 /**
@@ -2540,11 +2542,11 @@ function isInsultOrProvocation(rawText) {
   if (!rawText || typeof rawText !== 'string') return false;
   const t = normalizeTextForAutoMod(rawText);
 
-  // Insults explicitly targeting Jaafar or the bot
+  // Insults explicitly targeting Jaafar or the bot (allowing 0-3 intermediate filler words like "انت", "والله", "ياخي")
   const targetInsults = [
-    /(جعفر|بوت|jaafar|jaafarbot)\s*(غبي|حمار|كلب|زق|حيوان|فاشل|تافه|حقير|سخيف|معفن|زباله|خايس|سقيم|مريض|انقلع|اسكت|انكتم|انطم|ورع|خرا|قذر|واطي|منحط|اهبل|مغفل|يلعنك|لعنك|قذر)/i,
-    /(يلعن|تف على|تفو على|طز في|كس ام|يلعن شكل|الله يلعن|عنك)\s*(جعفر|البوت|jaafar)/i,
-    /(يا\s*)?(غبي|حمار|كلب|زق|حيوان|فاشل|تافه|حقير|سخيف|معفن|زباله|خايس|سقيم|واطي|خسيس|وقح|نذل|رخمه|منحط|اهبل|مغفل)\s*(يا\s*)?(جعفر|بوت|jaafar)/i,
+    /(?:جعفر|بوت|jaafar|jaafarbot)\s*(?:\S+\s+){0,3}(?:غبي|حمار|كلب|زق|حيوان|فاشل|تافه|حقير|سخيف|معفن|زباله|خايس|سقيم|مريض|انقلع|اسكت|انكتم|انطم|ورع|خرا|قذر|واطي|منحط|اهبل|مغفل|يلعنك|لعنك|سافل|مستفز|ماتفهم|ما تفهم|زفت|مخيس|سد حلقك|خلك ساكت)/i,
+    /(?:يلعن|تف علي|تفو علي|طز في|كس ام|يلعن شكل|الله يلعن|عنك)\s*(?:\S+\s+){0,3}(?:جعفر|البوت|بوت|jaafar)/i,
+    /(?:يا\s*)?(?:غبي|حمار|كلب|زق|حيوان|فاشل|تافه|حقير|سخيف|معفن|زباله|خايس|سقيم|واطي|خسيس|وقح|نذل|رخمه|منحط|اهبل|مغفل|سافل|مستفز|مخيس|زفت)\s*(?:\S+\s+){0,3}(?:يا\s*)?(?:جعفر|بوت|jaafar|jaafarbot)/i,
   ];
 
   if (targetInsults.some(regex => regex.test(t))) {
@@ -2553,8 +2555,8 @@ function isInsultOrProvocation(rawText) {
 
   // General severe abusive insults & harassment phrases
   const severeAbusePatterns = [
-    /(?:^|\s)(?:يا\s*)?(?:غبي|حمار|كلب|زق|حيوان|فاشل|تافه|حقير|سخيف|معفن|زباله|خايس|واطي|خسيس|وقح|نذل|رخمه|منحط|سافل|اهبل|مغفل)(?:$|\s|[!?.،,])/i,
-    /(?:انقلع|انطم|انكتم|كل تبن|كل زق|كل خرا|كل خري|ابن الكلب|ابن الحرام|تف عليك|تفو عليك|يلعنك|الله يلعنك|يا ورع|يا قليل الادب|يا قليل الحياء)/i,
+    /(?:^|\s)(?:يا\s*)?(?:غبي|حمار|كلب|زق|حيوان|فاشل|تافه|حقير|سخيف|معفن|زباله|خايس|واطي|خسيس|وقح|نذل|رخمه|منحط|سافل|اهبل|مغفل|مستفز|مخيس|زفت)(?:$|\s|[!?.،,])/i,
+    /(?:انقلع|انطم|انكتم|كل تبن|كل زق|كل خرا|كل خري|ابن الكلب|ابن الحرام|تف عليك|تفو عليك|يلعنك|الله يلعنك|يا ورع|يا قليل الادب|يا قليل الحياء|سد حلقك|خلك ساكت|ما تفهم|ماتفهم)/i,
     /\b(fuck\s+(?:you|u|jaafar|bot)?|stfu|shut\s+up\s*(?:jaafar|bot)?|bitch|idiot\s+bot|stupid\s+bot|trash\s+bot|dumb\s+bot|worthless\s+bot|asshole)\b/i,
   ];
 
